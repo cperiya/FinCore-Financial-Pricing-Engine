@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FinCore.Api/FinCore.Api.csproj" />
+    <Project Path="src/FinCore.Application/FinCore.Application.csproj" />
+    <Project Path="src/FinCore.Domain/FinCore.Domain.csproj" />
+    <Project Path="src/FinCore.Infrastructure/FinCore.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FinCore.UnitTests/FinCore.UnitTests.csproj" />
+  </Folder>
+</Solution>

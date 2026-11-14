@@ -1,0 +1,29 @@
+@FinCore.Api_HostAddress = http://localhost:5157
+
+### API discovery
+GET {{FinCore.Api_HostAddress}}/
+Accept: application/json
+
+###
+
+### Value a stock position
+GET {{FinCore.Api_HostAddress}}/api/pricing/stock?symbol=msft&unitPrice=12.50&quantity=4
+Accept: application/json
+
+###
+
+### Negative price is rejected
+GET {{FinCore.Api_HostAddress}}/api/pricing/stock?symbol=MSFT&unitPrice=-12.50&quantity=4
+Accept: application/json
+
+###
+
+### Missing symbol is rejected
+GET {{FinCore.Api_HostAddress}}/api/pricing/stock?unitPrice=12.50&quantity=4
+Accept: application/json
+
+###
+
+### Zero quantity is rejected
+GET {{FinCore.Api_HostAddress}}/api/pricing/stock?symbol=MSFT&unitPrice=12.50&quantity=0
+Accept: application/json
