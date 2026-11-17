@@ -1,3 +1,4 @@
+using FinCore.Domain.Portfolios;
 using FinCore.Domain.Valuation;
 
 namespace FinCore.Application.Pricing;
@@ -25,7 +26,10 @@ public sealed class StockPricingService : IStockPricingService
     /// <summary>
     /// Values a stock position and returns its normalized symbol, inputs, and market value.
     /// </summary>
-    /// <param name="symbol">The required stock symbol; surrounding whitespace is removed and letters are uppercased.</param>
+    /// <param name="symbol">
+    /// The required stock symbol; surrounding whitespace is removed and letters are uppercased.
+    /// No instrument-registration length limit is applied.
+    /// </param>
     /// <param name="unitPrice">The positive price of one share in the caller's currency.</param>
     /// <param name="quantity">The positive number of shares.</param>
     /// <returns>The input values and calculated market value in the same currency.</returns>
@@ -38,12 +42,7 @@ public sealed class StockPricingService : IStockPricingService
     /// </exception>
     public StockValuationResult ValueStock(string symbol, decimal unitPrice, decimal quantity)
     {
-        if (string.IsNullOrWhiteSpace(symbol))
-        {
-            throw new ArgumentException("A non-empty stock symbol is required.", nameof(symbol));
-        }
-
-        string normalizedSymbol = symbol.Trim().ToUpperInvariant();
+        string normalizedSymbol = StockSymbolNormalizer.Normalize(symbol);
         decimal marketValue = _stockValuationService.CalculateMarketValue(unitPrice, quantity);
         return new StockValuationResult(normalizedSymbol, unitPrice, quantity, marketValue);
     }

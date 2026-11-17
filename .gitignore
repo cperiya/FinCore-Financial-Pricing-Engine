@@ -5,6 +5,8 @@
 
 # dotenv files
 .env
+.env.*
+!.env.example
 
 # User-specific files
 *.rsuser
@@ -273,6 +275,12 @@ ServiceFabricBackup/
 *.mdf
 *.ldf
 *.ndf
+*.bak
+*.trn
+*.dmp
+*.dump
+/secrets/
+/docker-data/
 
 # Business Intelligence projects
 *.rdl.data

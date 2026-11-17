@@ -1,9 +1,17 @@
 # FinCore – Financial Pricing & Portfolio Risk Engine
 
 FinCore is a .NET 10 modular-monolith starter for a financial pricing and
-portfolio risk engine. The first implemented feature values one stock
-position. It does **not** load live market data, identify a currency, convert
-between currencies, or persist positions.
+portfolio risk engine. Its HTTP API values stock positions and supports USD
+portfolio, equity instrument, trade, derived-position, and simulated market
+price workflows. Portfolio persistence uses EF Core 10 and SQL Server 2022;
+trade writes use transaction-owned SQL Server locks. The initial migration is
+applied to the local `FinCore` development database. FinCore does **not** load
+live market data, convert between currencies, or persist derived positions.
+
+> **Development-only security warning:** This API currently has no
+> authentication or authorization. It is intended for trusted local
+> development and educational use only. Do not expose it to the public
+> internet or untrusted networks.
 
 ## Implemented: stock position valuation
 
@@ -15,8 +23,10 @@ MarketValue = UnitPrice * Quantity
 
 Both inputs use `decimal`. Unit price and quantity must be greater than zero;
 negative and zero values are rejected. Fractional share quantities are
-supported. A non-empty symbol is required and normalized to uppercase. If the
-product exceeds the range of `decimal`, the API returns a validation error.
+supported. A non-empty symbol is required and normalized to uppercase; the
+legacy stock-pricing endpoint does not apply the 20-character registered-
+instrument storage limit. If the product exceeds the range of `decimal`, the
+API returns a validation error.
 
 Currency is caller-known: `UnitPrice` and `MarketValue` are assumed to use the
 same currency. The request and response do not carry a currency code, and no
@@ -58,8 +68,7 @@ the application name, description, and a templated stock valuation link. The
 OpenAPI link is included only in Development, where the OpenAPI endpoint is
 mapped.
 
-The root URL returns JSON application information and links. The stock
-valuation request flow is: HTTP query binding and validation in
+The stock valuation request flow is: HTTP query binding and validation in
 `FinCore.Api` → symbol normalization and use case in
 `FinCore.Application` → arithmetic and positive-value invariants in
 `FinCore.Domain` → application result → HTTP response. See the
@@ -67,20 +76,308 @@ valuation request flow is: HTTP query binding and validation in
 [class and method reference](docs/class-method-reference.md) for the full
 contract and source walkthrough.
 
+## Portfolio Application workflows
+
+The API and Application layers can create, retrieve, and list USD portfolios;
+register USD equity instruments with trimmed, uppercase unique symbols;
+record BUY and SELL trades; derive positions from trade history; and record or
+retrieve simulated USD market prices. See the [REST API reference](docs/api-documentation.md)
+for all endpoint contracts and examples.
+
+Trade recording validates the complete chronological position history,
+including backdated candidates. Ordering is execution time, BUY before SELL,
+then trade ID; any intermediate negative holding rejects the write. A
+caller-supplied trade GUID is the idempotency key and the persisted trade
+primary key. An identical retry returns the existing trade; using that ID for
+a different payload produces an explicit conflict.
+
+Each BUY and SELL runs in a SQL Server `SERIALIZABLE` transaction and acquires
+transaction-owned exclusive `sp_getapplock` locks for the trade ID and
+portfolio/instrument position in ordinal resource-name order. A competing
+trade for the same position waits, then validates against the committed
+history. Lock timeouts, deadlocks, command timeouts, and recognized severe SQL
+TCP connection timeouts fail explicitly and roll back; only the recognized
+transient errors map to a sanitized `503`, while authentication and SQL
+configuration errors are not classified as retryable. After an uncertain
+trade outcome, retry the same payload with the same trade ID. Market-price
+lookup requires an explicit UTC cutoff and returns only a price with
+`AsOfUtc <= cutoff`, or `null` when no eligible price exists.
+
+### Portfolio and trading REST API
+
+The API exposes:
+
+- `POST /api/portfolios`, `GET /api/portfolios`,
+  `GET /api/portfolios/{id}`, and `GET /api/portfolios/{id}/positions`.
+- `POST /api/instruments`, `POST /api/portfolios/{id}/trades`,
+  `POST /api/instruments/{id}/prices`, and
+  `GET /api/instruments/{id}/prices/latest?asOfUtc=...`.
+- `GET /api/portfolios/{id}/valuation?asOfUtc=...` values every open position
+  at one UTC cutoff. If omitted, the Application service captures
+  `TimeProvider.GetUtcNow()` once for the request.
+
+Request DTOs enforce USD-only currency, string-valued trade sides, positive
+`decimal(28,10)` values, and zero-offset UTC timestamps. The controllers
+delegate trade and position decisions to the existing Application and Domain
+logic. Portfolio creation returns `201 Created` with a `Location`; the other
+POST operations return `200 OK`, including exact trade replays, because this
+minimal surface has no exact-resource GET endpoints for them. A caller-supplied
+`tradeId` is the retry key. Exact retries return the stored trade, while
+conflicting payloads and oversells return `409`. Known lock timeouts and
+deadlocks return `503` with a retry hint; retry the identical payload with the
+same trade ID. All errors use Problem Details without database details.
+
+Portfolio valuation includes only trades and market prices at or before the
+effective cutoff. It reuses the Domain position calculator and
+`StockValuationService`, returns each open position's symbol, quantity,
+selected USD price and timestamp, unrounded market value, and the USD total.
+An empty or fully closed portfolio returns an empty positions list and a zero
+total. If any open position lacks an eligible price, the whole request returns
+`409` with all affected instrument IDs and symbols; no partial total is
+returned. Old prices are not rejected as stale, but their observation times
+are included. Future-dated prices are excluded.
+
+The valuation reads execute sequentially, without tracking, in a read-only
+SQL Server `SERIALIZABLE` transaction on the scoped `FinCoreDbContext`.
+Serializable range locks can block concurrent trade or price writes and may
+cause deadlocks; known deadlocks are rolled back and reported as retryable
+`503` responses. For example, a 100-share MSFT buy, a 20-share sale, and an
+eligible simulated USD 450 price produce a remaining quantity of 80 and a
+market value of USD 36,000.
+
 ## Projects and dependency direction
 
 | Project | Responsibility |
 | --- | --- |
 | `FinCore.Api` | HTTP endpoints, request validation, response mapping, and application composition. |
-| `FinCore.Application` | `IStockPricingService` use case and its result model. |
-| `FinCore.Domain` | Stock market-value calculation and positive-value rules. |
-| `FinCore.Infrastructure` | Reserved for future persistence and integrations; no adapters yet. |
-| `FinCore.UnitTests` | xUnit domain tests and in-memory API integration tests. |
+| `FinCore.Application` | Stock-pricing, portfolio-management, and portfolio-valuation use cases, repository contracts, and unit-of-work transaction contract. |
+| `FinCore.Domain` | Stock market-value calculation, USD portfolio entities, and long-only position rules. |
+| `FinCore.Infrastructure` | EF Core 10 SQL Server context, mappings, repositories, migrations, and dependency-injection registration. |
+| `FinCore.UnitTests` | xUnit Domain and Application tests plus in-memory API integration tests. |
+| `FinCore.IntegrationTests` | Opt-in SQL Server persistence, transaction, and HTTP tests using a run-owned test database. |
 
 Dependencies point inward: API → Application → Domain; API → Infrastructure
-for future adapter composition; Infrastructure → Application and Domain.
-UnitTests references API for its HTTP integration test and Application and
-Domain for valuation tests; it does not reference Infrastructure.
+for adapter composition; Infrastructure → Application and Domain.
+Application and Domain do not reference EF Core. UnitTests references the API,
+Application, and Domain; IntegrationTests references Infrastructure and
+the API and exercises the SQL Server adapters through HTTP.
+
+### Cryptography package version safeguard
+
+`FinCore.Infrastructure` explicitly references
+`System.Security.Cryptography.Xml` 9.0.21 as a dependency-version safeguard;
+Infrastructure source does not directly use its APIs. Removing this
+reference caused restore to select vulnerable transitive versions of
+`System.Security.Cryptography.Xml` 9.0.0 and
+`System.Security.Cryptography.Pkcs` 9.0.4, producing NU1902/NU1903 warnings.
+Keep the explicit safeguard in place unless the underlying dependency graph
+can be changed without restoring those vulnerable versions. The current
+Infrastructure graph resolves Xml 9.0.21 and Pkcs 9.0.21. The API separately
+pins `System.Security.Cryptography.Pkcs` 9.0.23; that remediation remains
+unchanged.
+
+## Local SQL Server 2022 development environment
+
+FinCore provides a local SQL Server 2022 Developer Edition container for
+learning and development only; it is not production configuration. The API
+can connect when `ConnectionStrings__FinCore` is provided. The initial
+migration has been applied to the `FinCore` development database. The Domain
+project remains independent of EF Core and SQL Server.
+
+### Docker Desktop on Windows
+
+Use Docker Desktop with the WSL 2 engine, Linux containers, and WSL integration
+enabled for the working distribution. Run the following commands from the
+repository root in PowerShell:
+
+```powershell
+Copy-Item .\.env.example .\.env
+notepad .\.env
+```
+
+Replace the placeholder password in `.env` with a unique, strong local
+password before starting SQL Server. The SQL Server image requires at least
+eight characters and characters from at least three of these groups:
+uppercase, lowercase, numeric, and special characters. Keep `.env` local; Git
+ignores it.
+
+```powershell
+docker compose config --quiet
+docker compose up -d
+docker compose ps
+docker compose logs --tail 100 sqlserver
+```
+
+Wait for SQL Server's ready-for-client-connections message in the logs. To
+verify SQL authentication without putting the password in the command line,
+open the SQL prompt inside the container. `sqlcmd` prompts for the password;
+enter it without echoing it, then run a test query:
+
+```powershell
+docker compose exec sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C
+```
+
+At the `sqlcmd` prompt:
+
+```text
+SELECT DB_NAME();
+GO
+```
+
+The query should return `master`. If the `sqlcmd` path is unavailable in the
+image, connect with a local SQL client as described below.
+
+### Compose configuration
+
+| Property | Purpose |
+| --- | --- |
+| `services` / `sqlserver` | Defines the SQL Server service and its Compose network name. |
+| `image` | Uses Microsoft's official SQL Server 2022 Linux image. |
+| `environment.ACCEPT_EULA` | Required by the image to accept the license terms. |
+| `environment.MSSQL_PID` | Selects Developer Edition for local learning and development. |
+| `environment.MSSQL_SA_PASSWORD` | Supplies the SA password through Compose interpolation from the untracked `.env`; startup fails if it is missing. |
+| `ports` | Publishes container port 1433 only on host loopback (`127.0.0.1`), not on external network interfaces. |
+| `volumes` service mapping | Mounts the named volume at `/var/opt/mssql`, where SQL Server stores database files. |
+| `restart` | Restarts the container after failure or Docker Desktop restart unless it was explicitly stopped. |
+| Top-level `volumes.sqlserver_data` | Declares persistent Docker-managed storage that survives container removal and recreation. |
+
+### Connecting and stopping
+
+From Windows, configure a SQL client such as SQL Server Management Studio,
+Azure Data Studio, or the VS Code SQL extension with:
+
+- Server: `127.0.0.1,1433`
+- Authentication: SQL Server Authentication
+- Login: `sa`
+- Password: the local value in `.env` (do not paste it into source files or command history)
+- Initial database: `master`
+- Encryption: enabled; trust the server certificate for this local development instance
+
+Another container on this Compose network should connect using host
+`sqlserver` and port `1433`. No application container or connection string is
+stored in the repository. The API reads the optional
+`ConnectionStrings:FinCore` setting from configuration (for example the
+`ConnectionStrings__FinCore` environment variable); ASP.NET Core maps the
+double underscore to the configuration separator. The value must be provided
+out of band and must not be committed or printed.
+
+Stop the service while preserving its database volume:
+
+```powershell
+docker compose down
+```
+
+`docker compose down --volumes` permanently deletes the named database volume.
+Do not use it unless you intentionally want to erase local database data.
+
+### Troubleshooting
+
+- If Docker cannot start a Linux image, enable the WSL 2 engine, Linux
+  containers, and the repository distribution's WSL integration in Docker
+  Desktop.
+- If port 1433 is already allocated, stop the other local SQL Server process
+  before starting this service; the configured binding intentionally remains
+  loopback-only on port 1433.
+- If startup fails password validation, set a password meeting SQL Server's
+  complexity requirements in `.env`, then retry and inspect
+  `docker compose logs --tail 100 sqlserver`.
+- Changing `.env` after the named volume has been initialized does not change
+  the SA password stored by SQL Server. Use the existing password to rotate
+  it, or intentionally discard the local data volume only if its data is no
+  longer needed.
+- SQL Server may take some time to become ready after the container starts.
+  Check its logs rather than relying only on `docker compose ps`.
+
+## Portfolio persistence and migration status
+
+The Application repository interfaces and Infrastructure EF Core 10
+implementation are present. The generated migration
+`20261115200739_InitialPortfolioPersistence` in
+[`Persistence/Migrations`](src/FinCore.Infrastructure/Persistence/Migrations/)
+has been applied to the local `FinCore` database. It creates `Portfolios`,
+`Instruments`, `Trades`, and `MarketPrices` with the configured constraints,
+foreign keys, and indexes. The separate `FinCoreIntegrationTests` database
+was not targeted.
+
+The applied schema was verified against SQL Server: portfolio and instrument
+names are `nvarchar(200)`, symbols are `nvarchar(20)` with a unique index,
+financial values are `decimal(28,10)`, and timestamps are
+`datetimeoffset(7)`. The trade-history and latest-price indexes match the
+repository query ordering documented in the
+[database design](docs/database-design.md).
+
+The API registers persistence only when `ConnectionStrings__FinCore` is set.
+Portfolio Application services are registered alongside the repositories and
+unit of work under the same condition; the existing stock endpoints remain
+available without a database connection.
+For local development, this PowerShell session-only setup reads the SA
+password from the ignored `.env` without echoing or placing it in command
+history. Use the same approach when running the API or EF Core commands:
+
+```powershell
+$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' }
+$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
+$env:ConnectionStrings__FinCore = "Server=127.0.0.1,1433;Database=FinCore;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True"
+# Run the local API or EF Core command in this PowerShell session.
+Remove-Item Env:\ConnectionStrings__FinCore -ErrorAction SilentlyContinue
+$saPassword = $null
+```
+
+The connection uses SQL authentication, encryption, and trusts the
+self-signed certificate only for this local development instance. There is no
+credential in `appsettings.json` or source code. Do not copy the password into
+a command literal, logs, or repository files.
+
+### SQL Server integration tests
+
+The SQL Server integration tests are opt-in. Set the test connection variable
+as shown below; its `FinCoreIntegrationTests` catalog is used only as the
+credential/configuration source and is never opened by the fixture. The
+fixture validates that the endpoint is local loopback port 1433 and that the
+connected server is SQL Server 2022 Developer Edition with the required
+administrative permission. It then uses `master` to create a fresh
+`FinCoreTestRun_<GUID>` database, applies the existing migration with
+`MigrateAsync`, and directs test contexts only to that generated database.
+
+The fixture records an ownership marker containing the run ID. Cleanup
+revalidates the generated name, local server, and exact ownership marker
+before dropping only that run's database. If any ownership check fails, it
+refuses to drop the database and reports the failure. A new fixture run uses
+a new GUID, so simultaneous runs do not share databases; SQL tests within a
+run are serialized. Test rows are isolated in the temporary database and do
+not accumulate between runs. Neither `FinCore` nor the existing
+`FinCoreIntegrationTests` database is modified, reset, or dropped.
+
+On Windows, keep the test connection's server address as
+`127.0.0.1,1433`, not `localhost,1433`. The Compose port is published only on
+IPv4, while Windows resolves `localhost` to IPv6 `::1` before IPv4
+`127.0.0.1`. Microsoft.Data.SqlClient can wait for its connection timeout on
+the unavailable IPv6 endpoint before reaching SQL Server. Using the explicit
+IPv4 address avoids that TCP pre-login timeout; encryption and certificate
+settings remain enabled. The integration fixture rejects `localhost,1433`
+and requires the explicit IPv4 endpoint for this documented local setup.
+
+The fixture applies migrations rather than calling `EnsureCreatedAsync`.
+`EnsureCreatedAsync` does not apply migration history and does not update an
+existing schema, so it is unsuitable for verifying migration behavior.
+
+```powershell
+$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' }
+$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
+$env:FINCORE_SQLSERVER_TEST_CONNECTION_STRING = "Server=127.0.0.1,1433;Database=FinCoreIntegrationTests;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True"
+dotnet test .\tests\FinCore.IntegrationTests\FinCore.IntegrationTests.csproj --filter "Category=Integration"
+Remove-Item Env:\FINCORE_SQLSERVER_TEST_CONNECTION_STRING -ErrorAction SilentlyContinue
+$saPassword = $null
+```
+
+Without that environment variable, these tests are skipped. The normal
+solution test run still executes the Domain and API tests. Migration tests
+verify `__EFMigrationsHistory`, foreign keys and restricted delete rules,
+check constraints, index key order, the unique symbol index, and rejection
+of duplicate symbols after Domain normalization.
+`PortfolioApiIntegrationTests` starts the API with the fixture connection and
+asserts that the resolved `FinCoreDbContext` database name is exactly the
+fixture's generated `FinCoreTestRun_<GUID>` before making HTTP requests.
 
 ## Build and test
 
@@ -92,10 +389,59 @@ dotnet build .\FinCore.slnx --no-restore
 dotnet test .\FinCore.slnx
 ```
 
+The Prompt 5A validation completed with a clean build (0 warnings and 0
+errors), 54 unit tests passed, and 14 opt-in SQL tests skipped in the
+solution-wide run because no SQL test connection was supplied. The SQL
+integration project was then run twice against fresh fixture-owned databases;
+each run passed all 14 tests with 0 failures and 0 skips. The vulnerability
+audit reported no vulnerable packages, and `git diff --check` passed.
+
+The fixture cleaned up both run-owned databases. A read-only post-test check
+found 0 remaining `FinCoreTestRun_` databases; `FinCore` still had 0 rows in
+each portfolio table, and `FinCoreIntegrationTests` retained 3 portfolios,
+6 instruments, 3 trades, and 9 market prices. Neither protected database was
+used as an integration-test target.
+
+Prompt 5B added the portfolio and trading REST API. Verification completed
+with a build at 0 warnings and 0 errors, 62 unit/in-memory HTTP tests passing,
+and 17 SQL Server integration tests passing in each of two fresh fixture runs
+(0 failures and 0 skips in both runs). The SQL-backed HTTP tests asserted that
+the API's resolved database name matched the current fixture-owned
+`FinCoreTestRun_<GUID>` before sending requests. The dependency vulnerability
+audit reported no vulnerable packages.
+
+Prompt 6 adds `GET /api/portfolios/{id}/valuation`. Valuation uses one UTC
+cutoff for historical trades and eligible prices, returns position-level
+values and a complete USD total, and rejects missing prices without a partial
+result. It uses batched no-tracking repository queries inside a read-only
+`SERIALIZABLE` transaction, with checked decimal arithmetic. No migration,
+schema, package, or existing Domain entity changes were needed.
+
+Prompt 6 verification: the solution build succeeded with 0 warnings and 0
+errors. The full solution run passed 78 unit/in-memory HTTP tests and skipped
+20 opt-in SQL tests (0 failures). The SQL Server integration suite passed 20
+tests on each of two fresh run-owned database runs (0 failures and 0 skips in
+either run), including historical cutoff, deterministic price ties,
+concurrent trade/price consistency, and the 80-share × USD 450 = USD 36,000
+HTTP valuation. The NuGet vulnerability audit found no vulnerable packages,
+and `git diff --check` was clean.
+
+The subsequent publication-audit follow-up preserved Milestone 1 stock
+pricing behavior for nonblank symbols longer than 20 characters while keeping
+the 20-character limit for registered instruments. The updated build passed
+with 0 warnings and 0 errors; 79 unit/in-memory HTTP tests and the fixture
+endpoint guardrail test passed, while 20 opt-in SQL tests were skipped in the
+solution run. Each of two isolated SQL runs passed all 20 tests with no
+failures or skips. The SQL fixture accepted the IPv4-only local endpoint,
+protected database row counts matched their prior values, and no run-owned
+databases remained.
+
 ## Documentation
 
 - [Architecture guide](docs/architecture.md) — project boundaries, design
   rationale, and end-to-end request flow.
+- [Database design](docs/database-design.md) — entity relationships, SQL
+  mappings, constraints, indexes, concurrency boundary, and migration status.
 - [API documentation](docs/api-documentation.md) — endpoint contract,
   validation, response, and currency assumptions.
 - [Class and method reference](docs/class-method-reference.md) — public
@@ -107,6 +453,7 @@ dotnet test .\FinCore.slnx
 
 ## Not implemented yet
 
-Portfolio aggregation, market-data integration, persistence, SQL Server,
-Entity Framework Core, Redis, Docker, Azure, and CI/CD remain out of scope.
-Any future financial examples or fixtures must use synthetic data.
+Live market-data integration, stale-price threshold enforcement, currency
+conversion, Redis, Azure, and CI/CD remain unimplemented. The Docker SQL
+Server service is local development infrastructure only. Any financial
+examples or fixtures must use synthetic data.
