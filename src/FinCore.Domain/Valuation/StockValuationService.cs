@@ -42,6 +42,6 @@ public sealed class StockValuationService
                 "Quantity must be greater than zero.");
         }
 
-        return unitPrice * quantity;
+        return checked(unitPrice * quantity);
     }
 }

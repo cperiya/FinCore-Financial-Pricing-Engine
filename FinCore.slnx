@@ -6,6 +6,7 @@
     <Project Path="src/FinCore.Infrastructure/FinCore.Infrastructure.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/FinCore.IntegrationTests/FinCore.IntegrationTests.csproj" />
     <Project Path="tests/FinCore.UnitTests/FinCore.UnitTests.csproj" />
   </Folder>
 </Solution>

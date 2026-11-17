@@ -98,6 +98,30 @@ public sealed class StockPricingEndpointTests
         Assert.Equal(45000m, body.GetProperty("marketValue").GetDecimal());
     }
 
+    /// <summary>
+    /// Verifies the stock pricing endpoint accepts symbols longer than the instrument storage limit.
+    /// </summary>
+    /// <returns>A task that completes when the HTTP response assertions finish.</returns>
+    [Fact]
+    public async Task GetStock_WithLongSymbol_PreservesSuccessfulResponse()
+    {
+        const string symbol = "abcdefghijklmnopqrstuvwxy";
+        using WebApplicationFactory<Program> factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response =
+            await client.GetAsync($"/api/pricing/stock?symbol={symbol}&unitPrice=12&quantity=2");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        JsonElement body = document.RootElement;
+        Assert.Equal(symbol.ToUpperInvariant(), body.GetProperty("symbol").GetString());
+        Assert.Equal(12m, body.GetProperty("unitPrice").GetDecimal());
+        Assert.Equal(2m, body.GetProperty("quantity").GetDecimal());
+        Assert.Equal(24m, body.GetProperty("marketValue").GetDecimal());
+    }
+
     private static WebApplicationFactory<Program> CreateFactory()
     {
         return new WebApplicationFactory<Program>()

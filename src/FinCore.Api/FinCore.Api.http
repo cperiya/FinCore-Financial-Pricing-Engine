@@ -1,4 +1,10 @@
 @FinCore.Api_HostAddress = http://localhost:5157
+@portfolioId = 11111111-1111-4111-8111-111111111111
+@instrumentId = 22222222-2222-4222-8222-222222222222
+@tradeId = 33333333-3333-4333-8333-333333333333
+
+# After creating a portfolio and instrument, replace the sample IDs above with
+# their returned IDs before sending the nested trade and price requests.
 
 ### API discovery
 GET {{FinCore.Api_HostAddress}}/
@@ -26,4 +32,90 @@ Accept: application/json
 
 ### Zero quantity is rejected
 GET {{FinCore.Api_HostAddress}}/api/pricing/stock?symbol=MSFT&unitPrice=12.50&quantity=0
+Accept: application/json
+
+###
+
+### Create a USD portfolio
+POST {{FinCore.Api_HostAddress}}/api/portfolios
+Content-Type: application/json
+
+{
+  "name": "Synthetic Growth Portfolio",
+  "baseCurrency": "USD"
+}
+
+###
+
+### List portfolios
+GET {{FinCore.Api_HostAddress}}/api/portfolios
+Accept: application/json
+
+###
+
+### Get a portfolio
+GET {{FinCore.Api_HostAddress}}/api/portfolios/{{portfolioId}}
+Accept: application/json
+
+###
+
+### Get trade-derived positions
+GET {{FinCore.Api_HostAddress}}/api/portfolios/{{portfolioId}}/positions
+Accept: application/json
+
+###
+
+### Value a portfolio at a historical UTC cutoff
+GET {{FinCore.Api_HostAddress}}/api/portfolios/{{portfolioId}}/valuation?asOfUtc=2026-11-16T15%3A30%3A00Z
+Accept: application/json
+
+###
+
+### Value a portfolio using the current UTC cutoff
+GET {{FinCore.Api_HostAddress}}/api/portfolios/{{portfolioId}}/valuation
+Accept: application/json
+
+###
+
+### Register a USD equity (symbols are normalized to uppercase)
+POST {{FinCore.Api_HostAddress}}/api/instruments
+Content-Type: application/json
+
+{
+  "symbol": "msft",
+  "name": "Synthetic Example Equity",
+  "currency": "USD"
+}
+
+###
+
+### Record a BUY with a stable caller-supplied tradeId
+POST {{FinCore.Api_HostAddress}}/api/portfolios/{{portfolioId}}/trades
+Content-Type: application/json
+
+{
+  "tradeId": "{{tradeId}}",
+  "instrumentId": "{{instrumentId}}",
+  "side": "Buy",
+  "quantity": 10,
+  "unitPrice": 25.50,
+  "executedAt": "2026-11-16T15:00:00Z"
+}
+
+###
+
+### Record a simulated USD market price
+POST {{FinCore.Api_HostAddress}}/api/instruments/{{instrumentId}}/prices
+Content-Type: application/json
+
+{
+  "price": 25.75,
+  "currency": "USD",
+  "asOfUtc": "2026-11-16T15:00:00Z"
+}
+
+###
+
+### Get the latest eligible market price at a UTC cutoff
+GET {{FinCore.Api_HostAddress}}/api/instruments/{{instrumentId}}/prices/latest?asOfUtc=2026-11-16T15%3A30%3A00Z
 Accept: application/json
