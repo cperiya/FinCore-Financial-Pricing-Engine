@@ -155,6 +155,7 @@ market value of USD 36,000.
 | `FinCore.Infrastructure` | EF Core 10 SQL Server context, mappings, repositories, migrations, and dependency-injection registration. |
 | `FinCore.UnitTests` | xUnit Domain and Application tests plus in-memory API integration tests. |
 | `FinCore.IntegrationTests` | Opt-in SQL Server persistence, transaction, and HTTP tests using a run-owned test database. |
+| `FinCore.Benchmarks` | Separate SQL-only portfolio valuation benchmarks using BenchmarkDotNet and a benchmark-owned database. |
 
 Dependencies point inward: API → Application → Domain; API → Infrastructure
 for adapter composition; Infrastructure → Application and Domain.
@@ -379,6 +380,101 @@ of duplicate symbols after Domain normalization.
 asserts that the resolved `FinCoreDbContext` database name is exactly the
 fixture's generated `FinCoreTestRun_<GUID>` before making HTTP requests.
 
+## SQL-only portfolio valuation benchmarks
+
+The separate `FinCore.Benchmarks` project measures the existing
+`PortfolioValuationApplicationService` against SQL Server. It uses
+BenchmarkDotNet 0.15.8 for mean, median, standard deviation, and
+`MemoryDiagnoser` allocation results, plus a repeated measurement mode for
+warm p50/p95/p99 latency and sequential throughput. The benchmark workloads
+contain 5, 50, 500, and 2,000 synthetic instruments. Each instrument has a
+100-share BUY, a 20-share SELL, an older price, one eligible price, and a
+future-dated price. Before results are recorded, the harness verifies
+80-share holdings, the eligible price timestamp and amount, and the expected
+portfolio total at the fixed UTC cutoff.
+
+Benchmarks require the local SQL Server 2022 Developer instance at
+`127.0.0.1,1433`. The process-scoped connection must target `master`, use
+encrypted SQL authentication, trust the local development certificate, and
+enable pooling. The fixture creates only a unique
+`FinCoreBenchmarkRun_<GUID>` database, applies the existing migration, records
+an ownership marker, and holds SQL application-lock leases for the worker
+lifecycle. Provisioning, migration, and seeding are not timed. Normal
+completion drops only the exact marked database; interrupted runs retain a
+manifest and are never cleaned by a broad name/prefix sweep. Generated
+BenchmarkDotNet output and manifests are ignored by Git.
+
+The paired translation runners validate every expected BenchmarkDotNet case
+and worker launch before reporting success. Partial artifacts are marked
+`INCOMPLETE` or `FAILED`. The database-free harness failure simulation is
+documented in the [performance guide](docs/performance-benchmarking.md).
+The default SQL-only BenchmarkDotNet entry point also checks its expected
+cases and returns a nonzero exit code for invalid or failed runs.
+
+The following is a local-development connection-string template, not a stored
+credential. Load the password from the ignored `.env` into this PowerShell
+process without printing it, then run the desired mode. These commands do not
+start Docker or modify either protected FinCore database:
+
+```powershell
+$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' } | Select-Object -First 1
+if (-not $passwordLine) { throw 'MSSQL_SA_PASSWORD is missing from .env.' }
+$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
+$env:FINCORE_BENCHMARK_SQLSERVER_CONNECTION_STRING = "Server=127.0.0.1,1433;Database=master;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True;Pooling=True;Connect Timeout=30"
+
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --filter "*PortfolioValuationBenchmarks*" --job short
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --e2e --samples 1000 --warmup 50
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --diagnostics --samples 1000 --warmup 50
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --translation-experiment --samples 100 --warmup 10
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --translation-validation --samples 100 --warmup 10
+
+Remove-Item Env:\FINCORE_BENCHMARK_SQLSERVER_CONNECTION_STRING -ErrorAction SilentlyContinue
+$saPassword = $null
+```
+
+The opt-in `--translation-experiment` compares the unchanged scalar-parameter
+queries with query-local EF Core 10 JSON collection parameters. It uses one
+ownership-verified database seeded with all four workloads; the parent keeps
+the database lease until all BenchmarkDotNet workers and repeated
+measurements finish. The worker processes verify the owner marker and never
+create or drop the database. The experimental option is disabled by default,
+and results are written under the ignored
+`BenchmarkDotNet.Artifacts\TranslationExperiment\` directory.
+The runner limits each variant/workload to at most 500 measured samples and
+100 warmups.
+
+The first end-to-end call per workload is reported separately as a client-cold
+call after seeding; the SQL Server buffer pool may already be warm. The
+specified warm-up calls are excluded from percentiles. End-to-end throughput
+is the sample count divided by the sum of measured call durations;
+each call creates a fresh DI scope and DbContext. The diagnostics mode is
+separate because command interception affects execution and reports async
+reader-command count and time to reader availability, not full EF
+materialization time. No EF queries are parallelized.
+
+If a process is interrupted, use only the exact generated database name
+printed by its run and the same process-scoped connection setup:
+
+```powershell
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --cleanup FinCoreBenchmarkRun_<GUID>
+```
+
+Cleanup requires the exact ignored run manifest, local SQL Server validation,
+the matching owner marker, and both lifecycle locks. It refuses to delete a
+database while its benchmark worker still holds a lease. See the
+[benchmark methodology and measured baseline](docs/performance-benchmarking.md)
+for the environment, actual results, and limitations.
+
+The separate `--translation-validation` run exercises 1, 5, 50, 500, 2,000,
+and 2,001 instruments with 12 trades per instrument, sparse/backdated prices,
+future prices, and same-time price-ID ties. It checks SQL batches and exact
+valuation equivalence in both collection modes, captures actual plans, and
+runs BenchmarkDotNet allocation measurements plus paired end-to-end
+percentiles. It keeps the existing 2,000-ID batches and the scalar production
+default unchanged. Sample counts are bounded to 200 and warmups to 30. Its
+separate reports and BDN output are written under the ignored
+`BenchmarkDotNet.Artifacts\TranslationValidation\` directory.
+
 ## Build and test
 
 Run from the repository root in PowerShell:
@@ -448,12 +544,16 @@ databases remained.
   FinCore types and methods, including parameters and return values.
 - [Learning journal](docs/learning-journal.md) — completed milestones,
   learning topics, and validation commands.
+- [Performance benchmarking](docs/performance-benchmarking.md) — SQL-only
+  benchmark workloads, safety, measurement methodology, and measured baseline.
 - [.github/copilot-instructions.md](.github/copilot-instructions.md) —
   repository-specific contribution expectations.
 
 ## Not implemented yet
 
 Live market-data integration, stale-price threshold enforcement, currency
-conversion, Redis, Azure, and CI/CD remain unimplemented. The Docker SQL
-Server service is local development infrastructure only. Any financial
-examples or fixtures must use synthetic data.
+conversion, Redis caching, parallel valuation, Azure, and CI/CD remain
+unimplemented. The SQL-only valuation baseline does not claim that parallel
+processing or caching improves performance. The Docker SQL Server service is
+local development infrastructure only. Any financial examples or fixtures
+must use synthetic data.

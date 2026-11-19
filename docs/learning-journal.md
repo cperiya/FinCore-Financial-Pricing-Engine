@@ -1,5 +1,224 @@
 # Learning journal
 
+## Milestone 3 Phase 3.2D – final EF Core translation validation
+
+**Implemented:** added a separate benchmark-only validation command and
+workload without changing the Phase 3.1/3.2C datasets or production query
+default. The new synthetic cases cover 1, 5, 50, 500, 2,000, and 2,001
+instruments, 12 trades per instrument, sparse and backdated prices, future
+prices, and same-time price-ID ties. The runner verifies exact valuation
+results and executed ID batches, captures actual plans, and measures matched
+scalar/JSON BenchmarkDotNet allocation and end-to-end results. Integration
+tests now compare both modes for missing prices, decimal accuracy, overflow,
+cancellation, and concurrent atomic trade/price writes.
+
+**Measured findings:** with the richer 12-trade workload, BDN allocations at
+2,000 instruments were 584,587.20 KB scalar and 17,587.48 KB JSON; at 2,001
+they were 584,656.35 KB and 17,635.50 KB. Paired end-to-end p50 was
+849.555/250.749 ms at 2,000 and 893.760/260.279 ms at 2,001 (scalar/JSON).
+Small-workload BDN latency was mixed, while end-to-end p50s were similar at
+1, 5, and 50 instruments. The 2,001 case retained two 2,000-bounded batches
+per repository and six reader commands in both modes.
+
+**Plan and design decisions:** 28 actual plans were captured only on the
+run-owned database at compatibility level 160. Scalar plans used scans and
+sort/hash operators at 500 and 2,000 IDs; JSON plans used nested loops and
+index seeks across the tested sizes. `OPENJSON` estimated 50 input rows for
+all collection sizes, including 2,000 actual IDs; no captured plan had
+warnings or spills. Retain the 2,000-ID batch size conservatively. Keep JSON
+opt-in: the large-workload gains are clear on this local synthetic workload,
+but small-case results are mixed, cardinality estimates remain a risk, and
+one local run is insufficient to promote the production default.
+
+**Verification:** Release solution build succeeded with zero warnings and
+errors; all 79 unit/HTTP tests and all 24 SQL integration tests passed. The
+transitive NuGet vulnerability audit found no vulnerable packages.
+Compatibility level was 160; the validation-owned database was cleaned,
+protected snapshots remained `FinCore` 0/0/0/0 and
+`FinCoreIntegrationTests` 3/6/3/9, no benchmark-owned database remained, and
+`git diff --check` passed. Reports and actual plans remain in the ignored
+`BenchmarkDotNet.Artifacts/TranslationValidation/` directory.
+
+**Not implemented:** production-default promotion, query or financial-rule
+changes, schema/index/migration changes, Redis, cache behavior, parallel
+valuation, package changes, commit, or push.
+
+## Milestone 3 Phase 3.2C – controlled EF Core collection translation experiment
+
+**Implemented:** added a default-off Infrastructure option to compare
+EF Core 10's existing scalar collection translation with query-local
+`EF.Parameter(batch).Contains(...)` for only the instrument and latest
+market-price ID predicates. Added a paired BenchmarkDotNet mode that keeps
+one ownership-verified database alive across worker processes, verifies
+generated SQL and expected valuation output, captures actual plans, and
+separately measures end-to-end percentiles and SQL reader durations. No
+package, schema, migration, trade behavior, Domain rule, API contract, Redis,
+or parallel EF query changed.
+
+**Measured findings:** the run-owned database used SQL Server 2022 Developer
+compatibility level 160 and was shared for both variants. SQL contained
+`N` scalar ID parameters for instruments and `N + 1` for prices in the
+default path; JSON mode used one ID JSON parameter and, for prices, one
+additional UTC cutoff parameter. EF's price query references that JSON
+parameter from two `OPENJSON` row sources after query translation.
+Historical cutoff, future-price exclusion, deterministic timestamp/ID
+tie-breaking, missing-price failure, and all synthetic totals remained
+correct.
+
+The nine-observation BDN median fell from 87.192 to 43.590 ms at 500
+instruments and from 783.105 to 185.066 ms at 2,000. Per-operation
+allocations fell from 38,230.95 to 1,931.11 KB and from 574,418.46 to
+7,386.88 KB respectively. The 100-sample paired end-to-end p50 fell from
+74.056 to 35.116 ms at 500 and from 588.181 to 101.355 ms at 2,000. At
+5 instruments the p50 was effectively unchanged. The two variants retained
+four reader commands per valuation.
+
+**Plan and design decisions:** at 500 and 2,000 instruments, captured scalar
+plans used clustered/index scans for these batch reads; JSON plans used
+clustered and market-price index seeks with no captured spills or warnings.
+The estimated plan cost was lower for JSON in both queries and workloads.
+However, SQL Server estimated each `OPENJSON` collection at 50 rows even
+when the actual input was 2,000. Keep the query option disabled by default
+and treat larger or production-like workloads as required follow-up before
+any promotion. BenchmarkDotNet used three launches and three measured
+iterations per launch; the 2,000 case remains noisy. Stage allocation deltas
+are approximate and are not substituted for `MemoryDiagnoser`.
+
+**Verification:** Release solution build succeeded with zero warnings and
+errors; all 79 unit/HTTP tests and all 22 SQL integration tests passed.
+The complete transitive NuGet audit found no vulnerable packages.
+Compatibility level was 160; the exact run-owned benchmark database was
+dropped after the worker lifecycle, pre-existing owned databases were
+preserved, and protected database snapshots remained unchanged
+(`FinCore` 0/0/0/0; `FinCoreIntegrationTests` 3/6/3/9). `git diff --check`
+passed. Results remain in the ignored
+`BenchmarkDotNet.Artifacts/TranslationExperiment/` directory.
+
+**Not implemented:** Redis, caching, migrations, schema/index changes,
+permanent activation of JSON translation, business-logic optimization,
+parallel valuation, or commit/push.
+
+## Milestone 3 Phase 3.2B – targeted allocation profiling
+
+**Implemented:** added a benchmark-only `--allocation-profile` mode that
+waits until its isolated run-owned SQL Server database is migrated, seeded,
+and correctness-checked before profiler attachment. It records paired
+diagnostics-off and diagnostics-on service-call windows for 50, 500, and
+2,000 instruments, after five warmups and with ten measured calls per mode.
+Each trace is bounded to 45 seconds and a 64 MB buffer. The final measured
+loop invokes the valuation service through a fresh DI scope and excludes the
+repeated output-validation pass; the instrumented mode resets its collector
+before each service call. Local traces and analysis reports remain
+Git-ignored for review.
+
+**Measured findings:** the installed `dotnet-trace` version was 10.0.750501.
+All three final traces had allocation stacks, zero lost events, and no
+allocation ticks without stacks. Sample-weighted estimated allocation per
+call was about 0.865 MB at 50 instruments, 39.198 MB at 500, and 588.194 MB
+at 2,000; the 50-instrument sample had only 81 allocation ticks and is sparse.
+At 500, `System.Char[]`, `System.Text.StringBuilder`, and `System.String`
+accounted for about 93.6% of sampled bytes; at 2,000, about 98.3%.
+
+**Root cause evidence:** 50/500 allocation stacks pass through EF Core
+`Uniquifier.Truncate` and `Uniquify`; at 2,000, the dominant stacks include
+`SqlNullabilityProcessor.ProcessInExpressionValues` and `VisitIn`. Both the
+instrument and latest-market-price repository queries pass up to 2,000 IDs
+through `batch.Contains(...)`, which requires per-execution SQL `IN` parameter
+expansion and name uniquification. This identifies the main allocation
+source, while the whole-service trace cannot exactly divide allocations
+between the two queries. The prior 3.2A stage deltas of roughly 285 MB each
+for instrument and market-price retrieval are consistent with that evidence.
+The Phase 3.1 allocation baseline grows about 45.5x for a 10x increase in IDs
+(50 to 500) and 15.0x for a 4x increase (500 to 2,000). This is measured
+superlinear growth, but the samples do not establish EF's asymptotic
+complexity.
+
+The 2,000-instrument trace observed 40 large-kind allocation ticks weighted
+at about 7.02 MB over ten calls and approximately 1,400 Gen0 GC start events.
+These are sampling/event counts, not exact LOH bytes, retained heap, or a GC
+pause-time measurement. The diagnostics-on/off estimated allocation
+difference was under 0.4% at 500 and 2,000, but the paired trace order and
+short sample count do not establish instrumentation latency overhead.
+The 500-instrument BDN mean versus end-to-end p50 discrepancy remains
+unresolved; profiler timings are not comparable because they run under
+GC tracing.
+
+**Engineering decisions:** preserve the SQL-only baselines and all trace
+artifacts, and make no production query, financial-rule, transaction,
+schema, API, Redis, or Docker changes. Future experiments should first
+benchmark smaller ID batches, then compare a server-side set input such as a
+table-valued or supported JSON parameter with matched correctness, query-plan,
+allocation, and latency measurements. A table-valued parameter would require
+a separate database-type deployment decision. EF operations remain
+sequential on the scoped context.
+
+**Verification:** Release solution build succeeded with 0 warnings and 0
+errors. The unit/in-memory HTTP suite passed 79 tests and the SQL integration
+suite passed 20 tests. The transitive NuGet vulnerability audit reported no
+vulnerable packages. No run-owned benchmark database remained; protected
+database snapshots were unchanged (`FinCore` 0/0/0/0 and
+`FinCoreIntegrationTests` 3/6/3/9). The generated profiler files are under
+the ignored `BenchmarkDotNet.Artifacts/AllocationTraces/` directory.
+
+**Not implemented:** allocation or query optimization, Redis, parallel
+valuation, migrations, schema/index changes, or a matched BDN/end-to-end
+timing experiment.
+
+## Milestone 3 Phase 3.2A – SQL valuation diagnostics
+
+**Implemented:** added an opt-in Application diagnostics sink used only by
+the benchmark project. It records actual valuation stage timings, logical
+input/output counts, approximate managed allocation deltas, and correlated
+reader command metrics without changing valuation rules, SQL queries,
+transaction isolation, migrations, or API contracts. Added isolated actual
+SQL execution-plan capture with `SET STATISTICS XML ON`, plus a separate
+diagnostic report directory.
+
+**Measured findings:** with 100 measured calls and 10 warmups, the 2,000
+instrument valuation averaged 637.665 ms in the diagnostic run. Trade
+retrieval averaged 26.266 ms, instrument retrieval/materialization 293.156
+ms, market-price retrieval/materialization 313.484 ms, position
+calculation 1.711 ms, and response construction plus checked summation
+0.546 ms. The two EF/SQL materialization stages accounted for the dominant
+approximate allocation deltas: about 285,293 KB for market prices and
+285,192 KB for instruments, against about 574,744 KB for the complete
+valuation. The workload returned 4,000 trades, 2,000 instruments, and 2,000
+eligible prices through four sequential reader commands.
+
+**SQL plan evidence:** the captured trade valuation plan used a clustered
+scan on `PK_Trades` followed by a sort; the existing
+`IX_Trades_Portfolio_Instrument_Execution` was not selected. The market
+price plan used the latest-price index with grouping/top-selection and sort
+operators. The instrument lookup used primary-key access with parameter
+joining and sorting. These findings are evidence for a future index/query
+investigation, not an approved optimization.
+
+**Diagnostic limitations:** allocation values are approximate process-wide
+deltas around asynchronous stage boundaries and are not authoritative
+ownership. BenchmarkDotNet remains authoritative for allocation-per-operation
+totals. Transaction begin/commit/disposal protocol work is not separately
+observable through the reader interceptor. The 500-instrument BDN mean versus
+end-to-end p50 difference remains unresolved because the runs differ in
+worker process, database population, warmup, plan-cache state, and summary
+statistic. No performance optimization, Redis integration, parallel
+valuation, migration, or schema change was implemented.
+
+**What to learn next:** use allocation-stack profiling or an equivalent
+controlled profiler on the isolated benchmark process to distinguish
+SqlClient/EF buffering from materialization and runtime allocations. Compare
+the captured trade plan with candidate indexes only in a future approved
+optimization phase, then repeat BDN and end-to-end measurements against
+matched database state.
+
+**Validation commands:**
+
+```powershell
+dotnet build .\FinCore.slnx --configuration Release
+dotnet test .\FinCore.slnx
+dotnet list .\FinCore.slnx package --vulnerable --include-transitive
+git diff --check
+```
+
 ## Milestone 1 – Solution and architecture scaffold
 
 **Implemented:** created and registered the .NET 10 solution structure with an
@@ -701,3 +920,98 @@ checks matched: `FinCore` had 0 portfolios, instruments, trades, and market
 prices; `FinCoreIntegrationTests` had 3 portfolios, 6 instruments, 3 trades,
 and 9 market prices. No run-owned database remained, and `git diff --check`
 passed.
+
+## Milestone 3 Phase 3.1 – SQL-only valuation performance baseline
+
+**Implemented:** added the separate `FinCore.Benchmarks` .NET 10 console
+project with BenchmarkDotNet 0.15.8. The benchmark references Application and
+Infrastructure without changing production valuation logic. Its deterministic
+5-, 50-, 500-, and 2,000-instrument workloads use fixed synthetic IDs, 100
+share BUYs, 20 share SELLs, older prices, eligible prices, and future-dated
+prices. Every workload verifies the expected 80-share holdings, inclusive
+historical price cutoff, selected timestamps, and total before measurement.
+The 2,000-instrument case exercises the existing 2,000-ID price-query batch
+boundary.
+
+**Safety and measurement decisions:** each run creates only a unique
+`FinCoreBenchmarkRun_<GUID>` database after validating the encrypted
+`127.0.0.1,1433` SQL Server 2022 Developer instance. It applies the existing
+migration, records a run marker, holds master and database SQL application-lock
+leases for the worker lifetime, and drops only the exact verified database.
+Interrupted runs retain an ignored manifest and require explicit
+name-specific cleanup. Protected `FinCore` and `FinCoreIntegrationTests`
+databases are never benchmark targets. Provisioning, migration, and seeding
+are outside timed operations. Valuation calls use fresh scopes and contexts,
+while EF reads remain sequential in the existing serializable transaction.
+
+**Measured baseline:** the Release repeated run used 10 warm-ups and 100
+samples per workload. Results were p50/p95/p99 in milliseconds and sequential
+calls per second: 5 instruments: 690.651 ms first call, 13.035/15.793/17.589
+ms, 76.74 calls/s; 50: 61.136 ms, 24.535/29.094/35.425 ms, 40.44 calls/s;
+500: 283.100 ms, 63.983/78.864/81.983 ms, 14.89 calls/s; 2,000: 1,988.790
+ms, 570.130/602.936/651.101 ms, 1.74 calls/s. BenchmarkDotNet ShortRun
+reported mean/median/stddev/allocations of 12.931/12.437/1.270 ms/226.04 KB,
+20.170/20.184/0.453 ms/839.68 KB, 118.187/121.547/7.359 ms/38,227.99 KB,
+and 627.316/626.140/3.241 ms/574,419.16 KB respectively. The separate
+diagnostics run observed 4 reader commands per valuation and SQL reader
+execution averages of 8.424, 17.506, 31.120, and 197.985 ms for those sizes.
+
+**Limitations:** a 1,000-sample attempt timed out in the existing SQL command
+during the 2,000-instrument workload and was not reported as a result. The
+completed 100-sample run is the accepted local baseline. It measures
+sequential service calls, not HTTP, Redis, parallelism, or production
+capacity. The large allocation and latency growth at 500/2,000 instruments
+are bottleneck signals for later query/materialization investigation, not
+evidence that caching or parallel valuation will improve performance.
+
+**Verification:** restore and Release build completed with 0 warnings and
+0 errors. The unit/in-memory HTTP suite passed 79 tests. The isolated SQL
+suite passed 20 tests with 0 failures and 0 skips. The full transitive NuGet
+audit reported no vulnerable packages; BenchmarkDotNet resolved to 0.15.8.
+Protected database snapshots remained FinCore 0/0/0/0 and
+FinCoreIntegrationTests 3/6/3/9. Benchmark-owned databases were safely
+cleaned, and `git diff --check` passed.
+
+## Milestone 3 benchmark harness reliability
+
+The paired translation runners now validate the complete workload/mode
+matrix, each report and each worker launch before writing a successful run
+report. A BenchmarkDotNet summary can contain failed reports, and a worker
+may return a nonzero exit code even after producing measurements, so neither
+summary presence nor measurements alone are sufficient. Partial BenchmarkDotNet
+exports remain local and are marked incomplete or failed rather than deleted.
+
+A database-free simulation exercises real successful and failing workers,
+missing and duplicate cases, missing summaries or launches, a nonzero exit
+with measurements, and missing allocation data. An additional intentionally
+failing worker verified cleanup of an ownership-checked benchmark database.
+The existing run-owned fixture remains responsible for verified cleanup.
+This change does not promote JSON translation, add caching or parallel
+valuation, or alter the earlier benchmark results.
+
+Verification used the existing Release build, 79 unit/HTTP tests and 24 SQL
+integration tests. A separate validation run completed all 12 BenchmarkDotNet
+cases and 36 worker launches; the final finite-statistics guard was added
+after that full run and exercised in the successful database-free simulation.
+The SQL failure simulation verified owned-database cleanup. Protected database
+row-count snapshots were unchanged, no benchmark-owned database remained,
+and the transitive vulnerability and whitespace checks passed.
+
+## Milestone 3 baseline runner reliability
+
+The default SQL-only entry point previously ignored BenchmarkDotNet summaries,
+so a failed case could leave the process reporting success. It now derives
+the expected cases from the parsed configuration and validates reports,
+worker exits, launch counts when explicitly configured, and required timing
+and allocation data. Failed or interrupted runs retain local status markers.
+Automatic launch counts remain controlled by BenchmarkDotNet.
+
+Baseline setup now attempts fixture cleanup when setup fails and reports both
+setup and cleanup exceptions if necessary. Cleanup still refuses a database
+without verified ownership; interrupted processes retain manifest-based
+recovery. Focused simulations cover the default process exit codes, failed
+setup after database initialization, and ownership refusals. A separate
+four-case SQL-backed dry run verified the default entry point; it is a
+functional smoke test, not a replacement performance baseline. The README
+connection-string example is explicitly local and obtains its password from
+the ignored environment file rather than embedding a credential.

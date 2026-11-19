@@ -35,6 +35,7 @@ public static class InfrastructureServiceCollectionExtensions
                 sqlServerOptions => sqlServerOptions.MigrationsAssembly(
                     typeof(FinCoreDbContext).Assembly.GetName().Name)));
 
+        services.AddOptions<PortfolioCollectionParameterOptions>();
         services.AddScoped<IPortfolioRepository, PortfolioRepository>();
         services.AddScoped<IInstrumentRepository, InstrumentRepository>();
         services.AddScoped<ITradeRepository, TradeRepository>();

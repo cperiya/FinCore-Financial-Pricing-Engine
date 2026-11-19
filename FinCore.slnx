@@ -9,4 +9,7 @@
     <Project Path="tests/FinCore.IntegrationTests/FinCore.IntegrationTests.csproj" />
     <Project Path="tests/FinCore.UnitTests/FinCore.UnitTests.csproj" />
   </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/FinCore.Benchmarks/FinCore.Benchmarks.csproj" />
+  </Folder>
 </Solution>
