@@ -19,8 +19,8 @@ The Domain project also contains USD-only portfolio entities and a
 trade-derived, long-only position calculation. The Application use cases and
 REST endpoints for portfolios, instruments, trades, positions, simulated
 market prices, and portfolio market valuation are implemented. EF Core 10
-SQL Server adapters are implemented; the initial migration is applied to the
-local `FinCore` database. See the
+SQL Server adapters and the initial migration are implemented; a fresh local
+development database must be migrated explicitly. See the
 [database design](database-design.md) and
 [README local database instructions](../README.md#local-sql-server-2022-development-environment).
 
@@ -34,6 +34,7 @@ local `FinCore` database. See the
 | `FinCore.Infrastructure` | EF Core context, SQL Server mappings and repositories, migrations, and DI registration | Application, Domain |
 | `FinCore.UnitTests` | xUnit domain tests and in-memory API integration tests | API, Application, Domain |
 | `FinCore.IntegrationTests` | Opt-in SQL Server persistence and HTTP integration tests | API, Infrastructure |
+| `FinCore.Benchmarks` | SQL-only valuation measurements, validation, and offline cache-feasibility experiments | Application, Infrastructure |
 
 ```text
 FinCore.Api ───────────────> FinCore.Application ──> FinCore.Domain
@@ -46,6 +47,7 @@ FinCore.UnitTests ────────> FinCore.Application
        └─────────────────> FinCore.Api (root endpoint integration test)
 FinCore.IntegrationTests ─> FinCore.Api ─> Application, Infrastructure
                          └──────────────────> Infrastructure, Domain
+FinCore.Benchmarks ───────> FinCore.Application, FinCore.Infrastructure
 ```
 
 Arrows are compile-time project references. The API registers Infrastructure
@@ -224,14 +226,59 @@ skipped the 20 opt-in SQL tests. Two isolated SQL runs each passed all 20
 tests with no failures or skips. The SQL test fixture requires
 `127.0.0.1,1433` for the local Windows Docker configuration.
 
-The `20261115200739_InitialPortfolioPersistence` EF Core migration is applied
-to the local `FinCore` database. The live schema was checked for the four
+The `20261115200739_InitialPortfolioPersistence` EF Core migration was applied
+to a local `FinCore` development database; fresh installations must apply it
+explicitly. That local schema was checked for the four
 tables, configured column types, indexes, foreign keys, delete behavior, and
 check constraints. SQL Server integration tests use a fresh,
 GUID-named database per fixture run, apply the migration with
 `MigrateAsync`, and drop only that database after validating its ownership
 marker. They use the existing `FinCoreIntegrationTests` connection only as a
 credential source and do not open or modify that database.
+
+## SQL-only performance experiments
+
+The separate [`FinCore.Benchmarks`](../benchmarks/FinCore.Benchmarks/) project
+references Application and Infrastructure, not the API host. BenchmarkDotNet
+measures service calls and managed allocations for synthetic portfolio
+workloads. Other runner modes measure sequential end-to-end service latency,
+SQL reader timing, stage diagnostics, and matched scalar/JSON translations.
+Provisioning and seeding are outside timed calls. Reader timing stops at
+reader availability; the full price stage includes EF materialization.
+First-client calls are not cold SQL measurements, and no shared SQL caches
+are cleared. See [performance benchmarking](performance-benchmarking.md) for
+workloads, sample counts, results, commands, and limitations.
+
+The benchmark fixture validates the local SQL Server 2022 Developer endpoint,
+creates a uniquely named `FinCoreBenchmarkRun_<GUID>` database, records an
+owner marker, applies the existing migration, and seeds synthetic data.
+Lifecycle locks and exact-name/marker checks protect cleanup; if ownership
+cannot be verified, it refuses to drop the database. Interrupted-run recovery
+also requires the matching ignored manifest. It never uses `FinCore` or
+`FinCoreIntegrationTests` as benchmark write targets or removes Docker
+volumes.
+
+`PortfolioValuationApplicationService` accepts an optional
+`IPortfolioValuationDiagnostics` sink and otherwise uses a no-op stage.
+The benchmark-only collector and SQL interceptor are registered only in
+benchmark-created providers, not normal API composition. Instrumentation
+adds overhead; SQL reader time and approximate process-wide allocation
+deltas must not be interpreted as uninstrumented per-call measurements.
+
+`PortfolioCollectionParameterOptions.UseJsonParameterForIds` defaults to
+`false`, so the instrument and latest-price ID batches retain scalar
+translation. An explicitly configured experimental provider can opt into
+query-local `EF.Parameter` JSON translation; no API configuration binding
+enables it automatically. Both modes retain the existing batch size and
+valuation rules. The 50-instrument JSON price-stage regression remains
+unexplained, so the default has not changed.
+
+The SQL-only cache-feasibility runner records selected price identities and
+uses an offline reuse oracle; its estimates are not Redis hit rates or
+measured Redis savings. Production Redis integration is deferred pending
+representative workload and consistency evidence. Parallel valuation was
+considered, but has not been implemented or benchmarked: EF operations remain
+sequential on the scoped context.
 
 ## Stock valuation request flow
 
@@ -403,7 +450,7 @@ comments; see the [class and method reference](class-method-reference.md).
 | [`src/FinCore.Infrastructure/Persistence/FinCoreDbContext.cs`](../src/FinCore.Infrastructure/Persistence/FinCoreDbContext.cs) | Defines SQL Server entity sets and applies explicit mappings. |
 | [`src/FinCore.Infrastructure/Persistence/Configurations/`](../src/FinCore.Infrastructure/Persistence/Configurations/) | Maps keys, precision, UTC/currency/type checks, foreign keys, delete behavior, and query indexes. |
 | [`src/FinCore.Infrastructure/Persistence/Repositories/`](../src/FinCore.Infrastructure/Persistence/Repositories/) | Implements Application repository contracts using asynchronous EF Core queries. |
-| [`src/FinCore.Infrastructure/Persistence/Migrations/`](../src/FinCore.Infrastructure/Persistence/Migrations/) | Contains the initial migration, applied to the local `FinCore` database, and its model snapshot. |
+| [`src/FinCore.Infrastructure/Persistence/Migrations/`](../src/FinCore.Infrastructure/Persistence/Migrations/) | Contains the initial migration and its model snapshot; fresh development databases require explicit migration. |
 | [`tests/FinCore.UnitTests/StockValuationServiceTests.cs`](../tests/FinCore.UnitTests/StockValuationServiceTests.cs) | Covers valid inputs, zero/negative rejection, precision, and overflow. |
 | [`tests/FinCore.UnitTests/ApiHomeEndpointTests.cs`](../tests/FinCore.UnitTests/ApiHomeEndpointTests.cs) | Verifies the root route and available links through in-memory HTTP requests. |
 | [`tests/FinCore.IntegrationTests/SqlServerPersistenceTests.cs`](../tests/FinCore.IntegrationTests/SqlServerPersistenceTests.cs) | Verifies SQL round trips, latest-price lookup, and rollback in a separate test database. |

@@ -4,8 +4,8 @@ FinCore is a .NET 10 modular-monolith starter for a financial pricing and
 portfolio risk engine. Its HTTP API values stock positions and supports USD
 portfolio, equity instrument, trade, derived-position, and simulated market
 price workflows. Portfolio persistence uses EF Core 10 and SQL Server 2022;
-trade writes use transaction-owned SQL Server locks. The initial migration is
-applied to the local `FinCore` development database. FinCore does **not** load
+trade writes use transaction-owned SQL Server locks. A fresh local `FinCore`
+development database requires the checked-in migration. FinCore does **not** load
 live market data, convert between currencies, or persist derived positions.
 
 > **Development-only security warning:** This API currently has no
@@ -155,6 +155,7 @@ market value of USD 36,000.
 | `FinCore.Infrastructure` | EF Core 10 SQL Server context, mappings, repositories, migrations, and dependency-injection registration. |
 | `FinCore.UnitTests` | xUnit Domain and Application tests plus in-memory API integration tests. |
 | `FinCore.IntegrationTests` | Opt-in SQL Server persistence, transaction, and HTTP tests using a run-owned test database. |
+| `FinCore.Benchmarks` | Separate SQL-only portfolio valuation benchmarks using BenchmarkDotNet and a benchmark-owned database. |
 
 Dependencies point inward: API → Application → Domain; API → Infrastructure
 for adapter composition; Infrastructure → Application and Domain.
@@ -180,9 +181,28 @@ unchanged.
 
 FinCore provides a local SQL Server 2022 Developer Edition container for
 learning and development only; it is not production configuration. The API
-can connect when `ConnectionStrings__FinCore` is provided. The initial
-migration has been applied to the `FinCore` development database. The Domain
-project remains independent of EF Core and SQL Server.
+can connect when `ConnectionStrings__FinCore` is provided. Apply the existing
+migration explicitly to a fresh development database as described below; the
+API does not migrate at startup. The Domain project remains independent of EF
+Core and SQL Server.
+
+### Prerequisites
+
+- .NET 10 SDK (`dotnet --version`).
+- Docker Desktop with Compose and Linux container support; the supplied
+  Compose file runs SQL Server 2022 Developer Edition.
+- EF Core command-line tooling compatible with the project's EF Core 10.0.0
+  packages. For example, install `dotnet-ef` 10.0.0 if it is not already
+  installed:
+
+  ```powershell
+  dotnet tool install --global dotnet-ef --version 10.0.0
+  dotnet ef --version
+  ```
+
+  If a global version is already installed, update it to 10.0.0 instead with
+  `dotnet tool update --global dotnet-ef --version 10.0.0`. Ensure the .NET
+  global tools directory is on `PATH`.
 
 ### Docker Desktop on Windows
 
@@ -199,7 +219,9 @@ Replace the placeholder password in `.env` with a unique, strong local
 password before starting SQL Server. The SQL Server image requires at least
 eight characters and characters from at least three of these groups:
 uppercase, lowercase, numeric, and special characters. Keep `.env` local; Git
-ignores it.
+ignores it. For the unquoted `.env` and connection-string examples below, use
+letters, digits, and special characters such as `!`, `_`, or `-`; avoid
+whitespace, quotes, semicolons, `$`, and `#`, which need additional escaping.
 
 ```powershell
 docker compose config --quiet
@@ -288,39 +310,82 @@ Do not use it unless you intentionally want to erase local database data.
 - SQL Server may take some time to become ready after the container starts.
   Check its logs rather than relying only on `docker compose ps`.
 
-## Portfolio persistence and migration status
+## Initialize the local development database
 
 The Application repository interfaces and Infrastructure EF Core 10
 implementation are present. The generated migration
 `20261115200739_InitialPortfolioPersistence` in
 [`Persistence/Migrations`](src/FinCore.Infrastructure/Persistence/Migrations/)
-has been applied to the local `FinCore` database. It creates `Portfolios`,
+creates `Portfolios`,
 `Instruments`, `Trades`, and `MarketPrices` with the configured constraints,
-foreign keys, and indexes. The separate `FinCoreIntegrationTests` database
-was not targeted.
+foreign keys, and indexes. A previous local development database was verified
+with this migration; a fresh clone and fresh Docker volume do not contain it.
 
-The applied schema was verified against SQL Server: portfolio and instrument
+The previously applied schema was verified against SQL Server: portfolio and instrument
 names are `nvarchar(200)`, symbols are `nvarchar(20)` with a unique index,
 financial values are `decimal(28,10)`, and timestamps are
 `datetimeoffset(7)`. The trade-history and latest-price indexes match the
 repository query ordering documented in the
 [database design](docs/database-design.md).
 
+After starting the local SQL Server service and waiting for it to be ready,
+run the following from the repository root in PowerShell. This is for a **fresh
+local development database only**. EF may create `FinCore` if it is absent.
+If `FinCore` already contains data or later migrations, inspect its state and
+obtain authorization before running an update: specifying an older target can
+otherwise reverse later migrations. Never use these instructions for
+`FinCoreIntegrationTests` or another database.
+
+The design-time `FinCoreDbContextFactory` reads `ConnectionStrings__FinCore`.
+The fixed server and catalog below select only `127.0.0.1,1433` and `FinCore`;
+verify that this endpoint is your intended local development SQL Server.
+Do not pass a connection string or password as a command-line argument.
+
+```powershell
+$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' } | Select-Object -First 1
+if (-not $passwordLine) { throw 'MSSQL_SA_PASSWORD is missing from .env.' }
+$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
+$env:ConnectionStrings__FinCore = "Server=127.0.0.1,1433;Database=FinCore;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True"
+
+dotnet ef database update 20261115200739_InitialPortfolioPersistence --project .\src\FinCore.Infrastructure\FinCore.Infrastructure.csproj --startup-project .\src\FinCore.Api\FinCore.Api.csproj --context FinCoreDbContext
+if ($LASTEXITCODE -ne 0) { throw 'Development database migration failed.' }
+```
+
+To verify the migration without placing the password in the command line,
+connect to the local database with the password prompt:
+
+```powershell
+docker compose exec sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -d FinCore
+```
+
+At the SQL prompt, run:
+
+```sql
+SELECT DB_NAME() AS DatabaseName;
+SELECT MigrationId FROM dbo.__EFMigrationsHistory ORDER BY MigrationId;
+GO
+```
+
+The database name should be `FinCore` and the history should include
+`20261115200739_InitialPortfolioPersistence`. If the image lacks that
+`sqlcmd` path, use a local SQL client with the connection settings above.
+
 The API registers persistence only when `ConnectionStrings__FinCore` is set.
 Portfolio Application services are registered alongside the repositories and
 unit of work under the same condition; the existing stock endpoints remain
-available without a database connection.
-For local development, this PowerShell session-only setup reads the SA
-password from the ignored `.env` without echoing or placing it in command
-history. Use the same approach when running the API or EF Core commands:
+available without a database connection. The API does **not** apply migrations
+on startup. In the same PowerShell session, start the API after verification:
 
 ```powershell
-$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' }
-$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
-$env:ConnectionStrings__FinCore = "Server=127.0.0.1,1433;Database=FinCore;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True"
-# Run the local API or EF Core command in this PowerShell session.
+dotnet run --project .\src\FinCore.Api\FinCore.Api.csproj
+```
+
+After stopping the API, clear the session-only connection and password:
+
+```powershell
 Remove-Item Env:\ConnectionStrings__FinCore -ErrorAction SilentlyContinue
 $saPassword = $null
+$passwordLine = $null
 ```
 
 The connection uses SQL authentication, encryption, and trusts the
@@ -378,6 +443,101 @@ of duplicate symbols after Domain normalization.
 `PortfolioApiIntegrationTests` starts the API with the fixture connection and
 asserts that the resolved `FinCoreDbContext` database name is exactly the
 fixture's generated `FinCoreTestRun_<GUID>` before making HTTP requests.
+
+## SQL-only portfolio valuation benchmarks
+
+The separate `FinCore.Benchmarks` project measures the existing
+`PortfolioValuationApplicationService` against SQL Server. It uses
+BenchmarkDotNet 0.15.8 for mean, median, standard deviation, and
+`MemoryDiagnoser` allocation results, plus a repeated measurement mode for
+warm p50/p95/p99 latency and sequential throughput. The benchmark workloads
+contain 5, 50, 500, and 2,000 synthetic instruments. Each instrument has a
+100-share BUY, a 20-share SELL, an older price, one eligible price, and a
+future-dated price. Before results are recorded, the harness verifies
+80-share holdings, the eligible price timestamp and amount, and the expected
+portfolio total at the fixed UTC cutoff.
+
+Benchmarks require the local SQL Server 2022 Developer instance at
+`127.0.0.1,1433`. The process-scoped connection must target `master`, use
+encrypted SQL authentication, trust the local development certificate, and
+enable pooling. The fixture creates only a unique
+`FinCoreBenchmarkRun_<GUID>` database, applies the existing migration, records
+an ownership marker, and holds SQL application-lock leases for the worker
+lifecycle. Provisioning, migration, and seeding are not timed. Normal
+completion drops only the exact marked database; interrupted runs retain a
+manifest and are never cleaned by a broad name/prefix sweep. Generated
+BenchmarkDotNet output and manifests are ignored by Git.
+
+The paired translation runners validate every expected BenchmarkDotNet case
+and worker launch before reporting success. Partial artifacts are marked
+`INCOMPLETE` or `FAILED`. The database-free harness failure simulation is
+documented in the [performance guide](docs/performance-benchmarking.md).
+The default SQL-only BenchmarkDotNet entry point also checks its expected
+cases and returns a nonzero exit code for invalid or failed runs.
+
+The following is a local-development connection-string template, not a stored
+credential. Load the password from the ignored `.env` into this PowerShell
+process without printing it, then run the desired mode. These commands do not
+start Docker or modify either protected FinCore database:
+
+```powershell
+$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' } | Select-Object -First 1
+if (-not $passwordLine) { throw 'MSSQL_SA_PASSWORD is missing from .env.' }
+$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
+$env:FINCORE_BENCHMARK_SQLSERVER_CONNECTION_STRING = "Server=127.0.0.1,1433;Database=master;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True;Pooling=True;Connect Timeout=30"
+
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --filter "*PortfolioValuationBenchmarks*" --job short
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --e2e --samples 1000 --warmup 50
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --diagnostics --samples 1000 --warmup 50
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --translation-experiment --samples 100 --warmup 10
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --translation-validation --samples 100 --warmup 10
+
+Remove-Item Env:\FINCORE_BENCHMARK_SQLSERVER_CONNECTION_STRING -ErrorAction SilentlyContinue
+$saPassword = $null
+```
+
+The opt-in `--translation-experiment` compares the unchanged scalar-parameter
+queries with query-local EF Core 10 JSON collection parameters. It uses one
+ownership-verified database seeded with all four workloads; the parent keeps
+the database lease until all BenchmarkDotNet workers and repeated
+measurements finish. The worker processes verify the owner marker and never
+create or drop the database. The experimental option is disabled by default,
+and results are written under the ignored
+`BenchmarkDotNet.Artifacts\TranslationExperiment\` directory.
+The runner limits each variant/workload to at most 500 measured samples and
+100 warmups.
+
+The first end-to-end call per workload is reported separately as a client-cold
+call after seeding; the SQL Server buffer pool may already be warm. The
+specified warm-up calls are excluded from percentiles. End-to-end throughput
+is the sample count divided by the sum of measured call durations;
+each call creates a fresh DI scope and DbContext. The diagnostics mode is
+separate because command interception affects execution and reports async
+reader-command count and time to reader availability, not full EF
+materialization time. No EF queries are parallelized.
+
+If a process is interrupted, use only the exact generated database name
+printed by its run and the same process-scoped connection setup:
+
+```powershell
+dotnet run --configuration Release --project .\benchmarks\FinCore.Benchmarks\FinCore.Benchmarks.csproj -- --cleanup FinCoreBenchmarkRun_<GUID>
+```
+
+Cleanup requires the exact ignored run manifest, local SQL Server validation,
+the matching owner marker, and both lifecycle locks. It refuses to delete a
+database while its benchmark worker still holds a lease. See the
+[benchmark methodology and measured baseline](docs/performance-benchmarking.md)
+for the environment, actual results, and limitations.
+
+The separate `--translation-validation` run exercises 1, 5, 50, 500, 2,000,
+and 2,001 instruments with 12 trades per instrument, sparse/backdated prices,
+future prices, and same-time price-ID ties. It checks SQL batches and exact
+valuation equivalence in both collection modes, captures actual plans, and
+runs BenchmarkDotNet allocation measurements plus paired end-to-end
+percentiles. It keeps the existing 2,000-ID batches and the scalar production
+default unchanged. Sample counts are bounded to 200 and warmups to 30. Its
+separate reports and BDN output are written under the ignored
+`BenchmarkDotNet.Artifacts\TranslationValidation\` directory.
 
 ## Build and test
 
@@ -448,12 +608,16 @@ databases remained.
   FinCore types and methods, including parameters and return values.
 - [Learning journal](docs/learning-journal.md) — completed milestones,
   learning topics, and validation commands.
+- [Performance benchmarking](docs/performance-benchmarking.md) — SQL-only
+  benchmark workloads, safety, measurement methodology, and measured baseline.
 - [.github/copilot-instructions.md](.github/copilot-instructions.md) —
   repository-specific contribution expectations.
 
 ## Not implemented yet
 
 Live market-data integration, stale-price threshold enforcement, currency
-conversion, Redis, Azure, and CI/CD remain unimplemented. The Docker SQL
-Server service is local development infrastructure only. Any financial
-examples or fixtures must use synthetic data.
+conversion, Redis caching, parallel valuation, Azure, and CI/CD remain
+unimplemented. The SQL-only valuation baseline does not claim that parallel
+processing or caching improves performance. The Docker SQL Server service is
+local development infrastructure only. Any financial examples or fixtures
+must use synthetic data.

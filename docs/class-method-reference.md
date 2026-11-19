@@ -1,8 +1,8 @@
 # Class and method reference
 
 This reference covers public FinCore types for portfolio domain rules,
-Application repository contracts, EF Core persistence, stock valuation, and
-root API discovery.
+Application contracts, EF Core persistence, stock valuation, and API discovery.
+It also summarizes the internal benchmark harness and diagnostic helpers.
 Framework-provided ASP.NET Core methods are described in the
 [architecture guide](architecture.md); they are not FinCore business methods.
 
@@ -176,7 +176,30 @@ File: [`src/FinCore.Application/Persistence/IUnitOfWork.cs`](../src/FinCore.Appl
 | `ExecuteReadOnlyInTransactionAsync<TResult>(Func<CancellationToken, Task<TResult>> operation, CancellationToken cancellationToken)` | Read-only operation and cancellation token | `Task<TResult>` | Runs the operation in a serializable transaction and commits without calling `SaveChangesAsync`; recognized connectivity timeouts are translated consistently at transaction startup and during reads. |
 | `ExecuteWithExclusiveLocksAsync<TResult>(IReadOnlyCollection<string> lockResources, Func<CancellationToken, Task<TResult>> operation, CancellationToken cancellationToken)` | Logical SQL lock resources, an operation, and cancellation token | `Task<TResult>` | Starts a serializable transaction, acquires distinct application locks in ordinal order, runs the operation, saves, and commits. Lock and SQL command timeouts raise `TimeoutException` unless canceled; deadlocks and recognized TCP wait timeouts are surfaced as retryable failures. |
 
+### `IPortfolioValuationDiagnostics` and `IPortfolioValuationDiagnosticStage`
+
+File: [`IPortfolioValuationDiagnostics.cs`](../src/FinCore.Application/Portfolios/IPortfolioValuationDiagnostics.cs)
+
+The optional Application-layer sink provides stage instrumentation without an
+EF Core dependency. Normal API composition does not register a sink; the
+valuation service uses a no-op stage when none is supplied.
+
+| Member | Inputs | Return | Behavior |
+| --- | --- | --- | --- |
+| `BeginStage(string stageName, int inputCount)` | Stage name and logical input count | `IPortfolioValuationDiagnosticStage` | Begins an optional measurement scope. |
+| `Complete(int outputCount)` | Logical output count | `void` | Completes the scope with its output count. |
+| `Dispose()` | None | `void` | Disposes the scope through `IDisposable`. The benchmark collector completes an unfinished scope with zero outputs. |
+
 ## Infrastructure
+
+### `PortfolioCollectionParameterOptions`
+
+File: [`PortfolioCollectionParameterOptions.cs`](../src/FinCore.Infrastructure/Persistence/PortfolioCollectionParameterOptions.cs)
+
+`UseJsonParameterForIds` is a `bool` property that defaults to `false`.
+Setting it to `true` through DI options selects query-local EF Core JSON
+collection parameters for the two batched valuation repository queries. The
+normal API registration does not bind or enable this option from configuration.
 
 ### `FinCoreDbContext`
 
@@ -231,6 +254,20 @@ latest prices are grouped by instrument and ordered by observation time then
 ID descending. Repositories receive the scoped `FinCoreDbContext`; add methods track changes
 but do not call `SaveChangesAsync`, so a use case can commit related changes
 as one unit.
+
+The internal
+[`InstrumentRepository`](../src/FinCore.Infrastructure/Persistence/Repositories/InstrumentRepository.cs)
+and
+[`MarketPriceRepository`](../src/FinCore.Infrastructure/Persistence/Repositories/MarketPriceRepository.cs)
+constructors accept the scoped context and
+`IOptions<PortfolioCollectionParameterOptions>`. `GetByIdsAsync` and the
+collection overload of `GetLatestAtOrBeforeAsync`, respectively, deduplicate
+IDs and execute no-tracking batches sequentially. With the default option they
+use `batch.Contains(...)`; the opt-in branch uses
+`EF.Parameter(batch).Contains(...)`. The price query still requires a
+zero-offset cutoff, includes `AsOfUtc <= cutoff`, and chooses the greatest
+timestamp then greatest ID. The single-instrument methods do not use this
+collection option.
 
 ### `FinCoreUnitOfWork`
 
@@ -289,10 +326,10 @@ File: [`src/FinCore.Infrastructure/Persistence/Migrations/`](../src/FinCore.Infr
 
 The `20261115200739_InitialPortfolioPersistence` migration creates the four
 tables, checks, relationships, and indexes described in the
-[database design](database-design.md). It has been applied to the local
-`FinCore` database and its tables, column types, indexes, foreign keys, delete
-rules, and check constraints were verified in SQL Server. The
-`FinCoreIntegrationTests` database was not targeted.
+[database design](database-design.md). It was applied and verified on a local
+development database; a fresh installation must apply it explicitly using the
+[README instructions](../README.md#initialize-the-local-development-database).
+The `FinCoreIntegrationTests` database was not targeted.
 
 | Method | Behavior |
 | --- | --- |
@@ -399,7 +436,8 @@ Files: [`IPortfolioValuationApplicationService.cs`](../src/FinCore.Application/P
 [`PortfolioValuationApplicationService.cs`](../src/FinCore.Application/Portfolios/PortfolioValuationApplicationService.cs), and
 [`PortfolioValuation.cs`](../src/FinCore.Application/Portfolios/PortfolioValuation.cs)
 
-The service captures one effective cutoff, runs sequential no-tracking reads
+The service accepts an optional `IPortfolioValuationDiagnostics` constructor
+argument, defaulting to `null`. It captures one effective cutoff, runs sequential no-tracking reads
 in a read-only serializable transaction, filters historical trades, derives
 positions through `PositionCalculationService`, fetches instruments and
 eligible prices in batches, then delegates position multiplication to
@@ -448,6 +486,26 @@ The internal `Translate(int errorNumber, byte errorClass, Exception providerExce
 and every missing instrument ID/symbol. `PortfolioValuationOverflowException`
 wraps decimal overflow with the portfolio ID and cutoff; neither exposes
 internal SQL details to the HTTP response.
+
+## Benchmark harness
+
+The separate benchmark project is not part of API composition. The following
+helpers are internal unless identified as public; see the
+[performance guide](performance-benchmarking.md) for executable commands,
+measurements, and safety requirements.
+
+| Component | Implemented behavior |
+| --- | --- |
+| [`Program`](../benchmarks/FinCore.Benchmarks/Program.cs) | Dispatches baseline, measurement, translation, feasibility, cleanup, and self-test modes. |
+| [`PortfolioValuationBenchmarks`](../benchmarks/FinCore.Benchmarks/PortfolioValuationBenchmarks.cs) | Public BenchmarkDotNet class: `GlobalSetupAsync()` creates and seeds an owned database and validates a result; `ValuePortfolioAsync()` measures a valuation; `GlobalCleanupAsync()` disposes services and safely cleans the database. Failed setup also attempts cleanup. |
+| [`PortfolioValuationTranslationBenchmarks`](../benchmarks/FinCore.Benchmarks/PortfolioValuationTranslationBenchmarks.cs) and [`PortfolioValuationTranslationValidationBenchmarks`](../benchmarks/FinCore.Benchmarks/PortfolioValuationTranslationValidationBenchmarks.cs) | Public BenchmarkDotNet classes with `InstrumentCount` and `UseJsonParameter` parameters. Their `GlobalSetupAsync()` verifies the parent-owned database and valuation; `ValuePortfolioAsync()` measures it; `GlobalCleanupAsync()` disposes the worker provider. |
+| [`BenchmarkDatabaseFixture`](../benchmarks/FinCore.Benchmarks/BenchmarkDatabaseFixture.cs) | `InitializeAsync()` validates the local server, creates an exact generated database, records ownership, and applies the existing migration. `DisposeAsync()` and `CleanupOwnedDatabaseAsync(string databaseName)` refuse unsafe deletion; interrupted recovery requires the matching manifest and locks. |
+| [`BenchmarkServiceProviderFactory`](../benchmarks/FinCore.Benchmarks/BenchmarkServiceProviderFactory.cs) | `Create(...)` composes a benchmark provider with optional diagnostics, interceptor, JSON mode, and price observer; `ValueAsync(...)` uses a fresh scope for one synthetic workload valuation. |
+| [`ValuationDiagnosticsCollector`](../benchmarks/FinCore.Benchmarks/ValuationDiagnostics.cs) and [`SqlCommandDiagnosticsInterceptor`](../benchmarks/FinCore.Benchmarks/SqlCommandDiagnosticsInterceptor.cs) | The collector implements `BeginStage`, records stage duration and approximate process-wide allocation deltas, and provides `Reset()`. The interceptor records async reader counts and durations through reader availability, not materialization. |
+| [`BaselineBenchmarkRunner`](../benchmarks/FinCore.Benchmarks/BaselineBenchmarkRunner.cs) and [`BenchmarkRunValidation`](../benchmarks/FinCore.Benchmarks/BenchmarkRunValidation.cs) | `Run(Type benchmarkType, string[] args)` validates the expected BenchmarkDotNet cases and returns a nonzero status on failure. `Validate(...)` and `ValidateBaseline(...)` check expected cases, launches, and required measurements. |
+| [`EndToEndMeasurementRunner`](../benchmarks/FinCore.Benchmarks/EndToEndMeasurementRunner.cs), [`CollectionParameterExperimentRunner`](../benchmarks/FinCore.Benchmarks/CollectionParameterExperimentRunner.cs), and [`CollectionParameterValidationRunner`](../benchmarks/FinCore.Benchmarks/CollectionParameterValidationRunner.cs) | Execute sequential service measurements and controlled translation comparisons; the validation runner also checks richer workloads and captures plans. |
+| [`CacheFeasibilityRunner`](../benchmarks/FinCore.Benchmarks/CacheFeasibilityRunner.cs), [`CacheFeasibilityWorkload`](../benchmarks/FinCore.Benchmarks/CacheFeasibilityWorkload.cs), and [feasibility helpers](../benchmarks/FinCore.Benchmarks/CacheFeasibilityBenchmarks.cs) | Run matched scalar/JSON pairs, validate actual price selections, and estimate exact-cutoff and interval reuse offline. The deterministic four-pair schedule counterbalances portfolio and mode order. The oracle is not a cache and does not measure Redis. |
+| [`BenchmarkValidationSelfTest`](../benchmarks/FinCore.Benchmarks/BenchmarkValidationSelfTest.cs) and [feasibility self-tests](../benchmarks/FinCore.Benchmarks/CacheFeasibilityBenchmarks.cs) | Exercise benchmark failure detection, oracle behavior, and schedule balance; SQL-specific fixture failure tests require the local benchmark connection. |
 
 ## API
 

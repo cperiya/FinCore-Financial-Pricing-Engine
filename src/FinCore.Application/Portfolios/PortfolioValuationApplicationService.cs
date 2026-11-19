@@ -17,6 +17,7 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
     private readonly PositionCalculationService _positionCalculationService;
     private readonly StockValuationService _stockValuationService;
     private readonly TimeProvider _timeProvider;
+    private readonly IPortfolioValuationDiagnostics? _diagnostics;
 
     /// <summary>
     /// Initializes portfolio valuation with repository, transaction, Domain-calculation, and clock dependencies.
@@ -29,6 +30,7 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
     /// <param name="positionCalculationService">The Domain long-only position calculator.</param>
     /// <param name="stockValuationService">The Domain stock market-value calculator.</param>
     /// <param name="timeProvider">The UTC clock used when no cutoff is supplied.</param>
+    /// <param name="diagnostics">An optional sink for benchmark-focused stage diagnostics.</param>
     /// <exception cref="ArgumentNullException">Thrown when a dependency is null.</exception>
     public PortfolioValuationApplicationService(
         IPortfolioRepository portfolios,
@@ -38,7 +40,8 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
         IUnitOfWork unitOfWork,
         PositionCalculationService positionCalculationService,
         StockValuationService stockValuationService,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        IPortfolioValuationDiagnostics? diagnostics = null)
     {
         ArgumentNullException.ThrowIfNull(portfolios);
         ArgumentNullException.ThrowIfNull(trades);
@@ -57,6 +60,7 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
         _positionCalculationService = positionCalculationService;
         _stockValuationService = stockValuationService;
         _timeProvider = timeProvider;
+        _diagnostics = diagnostics;
     }
 
     /// <inheritdoc />
@@ -82,23 +86,49 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
         DateTimeOffset asOfUtc,
         CancellationToken cancellationToken)
     {
+        using IPortfolioValuationDiagnosticStage transactionStage =
+            BeginStage("transaction.valuation", 0);
+        using IPortfolioValuationDiagnosticStage portfolioStage =
+            BeginStage("portfolio.lookup", 1);
         Portfolio? portfolio = await _portfolios.GetByIdAsync(portfolioId, cancellationToken);
         if (portfolio is null)
         {
+            portfolioStage.Complete(0);
             throw new PortfolioNotFoundException(portfolioId);
         }
 
+        portfolioStage.Complete(1);
+
+        using IPortfolioValuationDiagnosticStage tradeStage =
+            BeginStage("trade.retrieval-and-materialization", 1);
         IReadOnlyList<Trade> trades =
             await _trades.GetByPortfolioIdAtOrBeforeAsync(portfolioId, asOfUtc, cancellationToken);
+        tradeStage.Complete(trades.Count);
+
+        using IPortfolioValuationDiagnosticStage positionStage =
+            BeginStage("position.calculation-grouping-sorting", trades.Count);
         IReadOnlyList<Position> positions = _positionCalculationService.CalculatePositions(trades);
+        positionStage.Complete(positions.Count);
         if (positions.Count == 0)
         {
-            return new PortfolioValuation(portfolio.Id, portfolio.BaseCurrency, asOfUtc, [], 0m);
+            PortfolioValuation emptyValuation = new(portfolio.Id, portfolio.BaseCurrency, asOfUtc, [], 0m);
+            transactionStage.Complete(0);
+            return emptyValuation;
         }
 
+        using IPortfolioValuationDiagnosticStage instrumentInputStage =
+            BeginStage("instrument-id-collection", positions.Count);
         Guid[] instrumentIds = positions.Select(position => position.InstrumentId).ToArray();
+        instrumentInputStage.Complete(instrumentIds.Length);
+
+        using IPortfolioValuationDiagnosticStage instrumentStage =
+            BeginStage("instrument.retrieval-and-materialization", instrumentIds.Length);
         IReadOnlyList<Instrument> instruments =
             await _instruments.GetByIdsAsync(instrumentIds, cancellationToken);
+        instrumentStage.Complete(instruments.Count);
+
+        using IPortfolioValuationDiagnosticStage instrumentDictionaryStage =
+            BeginStage("instrument-dictionary-and-validation", instruments.Count);
         Dictionary<Guid, Instrument> instrumentsById = instruments.ToDictionary(instrument => instrument.Id);
         foreach (Guid instrumentId in instrumentIds)
         {
@@ -108,9 +138,16 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
                     $"Position instrument '{instrumentId}' does not exist in the instrument repository.");
             }
         }
+        instrumentDictionaryStage.Complete(instrumentsById.Count);
 
+        using IPortfolioValuationDiagnosticStage priceStage =
+            BeginStage("market-price.retrieval-and-materialization", instrumentIds.Length);
         IReadOnlyList<MarketPrice> marketPrices =
             await _marketPrices.GetLatestAtOrBeforeAsync(instrumentIds, asOfUtc, cancellationToken);
+        priceStage.Complete(marketPrices.Count);
+
+        using IPortfolioValuationDiagnosticStage valuationPreparationStage =
+            BeginStage("price-dictionary-and-missing-price-validation", marketPrices.Count);
         Dictionary<Guid, MarketPrice> pricesByInstrumentId =
             marketPrices.ToDictionary(marketPrice => marketPrice.InstrumentId);
 
@@ -126,9 +163,12 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
         {
             throw new MissingMarketPricesException(portfolioId, asOfUtc, missingInstruments);
         }
+        valuationPreparationStage.Complete(pricesByInstrumentId.Count);
 
         try
         {
+            using IPortfolioValuationDiagnosticStage responseStage =
+                BeginStage("valuation-response-and-checked-decimal-summation", positions.Count);
             decimal totalMarketValue = 0m;
             List<PortfolioValuationPosition> valuedPositions = new(positions.Count);
             foreach (Position position in positions)
@@ -148,16 +188,37 @@ public sealed class PortfolioValuationApplicationService : IPortfolioValuationAp
                     marketValue));
             }
 
-            return new PortfolioValuation(
+            PortfolioValuation valuation = new(
                 portfolio.Id,
                 portfolio.BaseCurrency,
                 asOfUtc,
                 valuedPositions,
                 totalMarketValue);
+            responseStage.Complete(valuedPositions.Count);
+            transactionStage.Complete(valuedPositions.Count);
+            return valuation;
         }
         catch (OverflowException exception)
         {
             throw new PortfolioValuationOverflowException(portfolioId, asOfUtc, exception);
+        }
+    }
+
+    private IPortfolioValuationDiagnosticStage BeginStage(string name, int inputCount)
+    {
+        return _diagnostics?.BeginStage(name, inputCount) ?? NoOpPortfolioValuationDiagnosticStage.Instance;
+    }
+
+    private sealed class NoOpPortfolioValuationDiagnosticStage : IPortfolioValuationDiagnosticStage
+    {
+        public static NoOpPortfolioValuationDiagnosticStage Instance { get; } = new();
+
+        public void Complete(int outputCount)
+        {
+        }
+
+        public void Dispose()
+        {
         }
     }
 }

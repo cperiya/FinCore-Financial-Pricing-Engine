@@ -1,6 +1,8 @@
 using FinCore.Application.Portfolios;
 using FinCore.Domain.Portfolios;
+using FinCore.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 namespace FinCore.Infrastructure.Persistence.Repositories;
 
@@ -11,14 +13,19 @@ internal sealed class InstrumentRepository : IInstrumentRepository
 {
     private const int MaximumIdsPerQuery = 2_000;
     private readonly FinCoreDbContext _dbContext;
+    private readonly bool _useJsonParameterForIds;
 
     /// <summary>
     /// Initializes a repository using the scoped persistence context.
     /// </summary>
     /// <param name="dbContext">The context that tracks instrument operations.</param>
-    public InstrumentRepository(FinCoreDbContext dbContext)
+    /// <param name="options">The opt-in ID collection parameter translation settings.</param>
+    public InstrumentRepository(
+        FinCoreDbContext dbContext,
+        IOptions<PortfolioCollectionParameterOptions> options)
     {
         _dbContext = dbContext;
+        _useJsonParameterForIds = options.Value.UseJsonParameterForIds;
     }
 
     /// <inheritdoc />
@@ -48,10 +55,11 @@ internal sealed class InstrumentRepository : IInstrumentRepository
         for (int offset = 0; offset < distinctIds.Length; offset += MaximumIdsPerQuery)
         {
             Guid[] batch = distinctIds.Skip(offset).Take(MaximumIdsPerQuery).ToArray();
-            Instrument[] matches = await _dbContext.Instruments
-                .AsNoTracking()
-                .Where(instrument => batch.Contains(instrument.Id))
-                .ToArrayAsync(cancellationToken);
+            IQueryable<Instrument> query = _dbContext.Instruments.AsNoTracking();
+            query = _useJsonParameterForIds
+                ? query.Where(instrument => EF.Parameter(batch).Contains(instrument.Id))
+                : query.Where(instrument => batch.Contains(instrument.Id));
+            Instrument[] matches = await query.ToArrayAsync(cancellationToken);
             instruments.AddRange(matches);
         }
 
