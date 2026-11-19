@@ -1,5 +1,66 @@
 # Learning journal
 
+## Milestone 3 Phase 3.3A - counterbalanced benchmark correction
+
+**Decision and implementation:** corrected the benchmark-only schedule so
+each four-pair block includes both measurement orders for both portfolios.
+Each scenario in a 100-pair run now records 25 pairs per portfolio/order.
+Run, phase, portfolio, block, order, sample and per-pair measurements are
+retained in the ignored traces; each scenario creates a fresh offline oracle.
+The original order-confounded reports and documentation remain available.
+
+**Results:** after focused scheduling/oracle checks and a six-pair pilot, three
+independent owned-database matrices each used 10 warmups and 100 pairs per
+scenario. At 50 instruments the corrected price-stage mean was
+4.523-5.863 ms scalar versus 17.376-30.264 ms JSON; JSON was slower in
+every portfolio/order subgroup. No plans were captured, so the cause is
+unknown. At 2,000, means were 278.728-285.079 ms scalar and
+49.429-54.486 ms JSON. Hypothetical reuse counts matched the original
+results; they are not measured Redis hit rates or savings. See
+[performance benchmarking](performance-benchmarking.md) for all results.
+
+**Verification and remaining work:** Release build succeeded with zero
+warnings/errors; scheduling and oracle checks, the pilot, 79 unit/HTTP and
+24 SQL integration tests passed; the vulnerability audit was clean. Protected
+row counts were unchanged and no benchmark-owned databases remained. Redis,
+revision coordination, production behavior changes and new migrations remain
+unimplemented; production Redis remains deferred.
+
+## Milestone 3 Phase 3.3A - SQL-only cache feasibility
+
+**Original measurement limitation:** portfolio A was always scalar-first
+and portfolio B always JSON-first. The original measurements below are
+preserved but are not a fully counterbalanced comparison.
+
+**Implemented:** a benchmark-only paired SQL workload runner, actual selected
+price-ID trace, and offline exact-cutoff and validity-interval reuse oracle.
+The oracle invalidates affected instruments on every synthetic price write;
+it is not a cache and does not model Redis latency. The existing price-stage
+diagnostics measure repository execution and materialization. A focused
+oracle self-test and a database-backed pilot precede the matrix.
+
+**Measured:** three independent Release runs each used 10 warmups and 100
+paired samples for four selected scenarios spanning 5 to 2,000 instruments.
+At 2,000, price-stage means were 284.917-298.469 ms scalar and
+53.224-53.589 ms JSON; the optimistic interval oracle observed 197,996 hits
+per 200,000 instrument observations and 95 fully reusable batches per 100.
+Changing cutoffs produced zero exact-key hits in the tested current-time
+scenarios. At 50 instruments JSON was slower than scalar in all three runs;
+no plans were captured, so the cause is unknown. Scenario factors are
+confounded, and these synthetic reuse estimates are not Redis performance.
+See [performance benchmarking](performance-benchmarking.md) for all results,
+assumptions and limitations.
+
+**Verification and decision:** the Release build had zero warnings/errors;
+79 unit/HTTP and 24 SQL integration tests passed; the oracle and SQL pilot
+passed; the NuGet vulnerability audit was clean. Owned benchmark databases
+were removed and protected database row counts stayed unchanged. Existing
+migrations were applied only to newly created owned benchmark/test databases
+with explicit approval. Production Redis remains deferred: revision reads,
+writer locking, invalidation, outage fallback and network costs are not
+measured. No Redis, new migration, production query, financial-rule, API or
+transaction change was implemented.
+
 ## Milestone 3 Phase 3.2D – final EF Core translation validation
 
 **Implemented:** added a separate benchmark-only validation command and

@@ -10,6 +10,29 @@ internal static class Program
             return 0;
         }
 
+        if (args.Length == 1 && args[0] == "--cache-feasibility-self-test")
+        {
+            CacheFeasibilitySelfTest.Run();
+            return 0;
+        }
+
+        if (args.Length == 1 && args[0] == "--cache-feasibility-schedule-self-test")
+        {
+            CacheFeasibilityScheduleSelfTest.Run();
+            return 0;
+        }
+
+        if (args.Length > 0 && args[0] == "--cache-feasibility")
+        {
+            if (args.Length > 2 || (args.Length == 2 && args[1] != "--pilot"))
+            {
+                throw new ArgumentException("Usage: --cache-feasibility [--pilot].");
+            }
+
+            await CacheFeasibilityRunner.RunAsync(args.Length == 2);
+            return 0;
+        }
+
         if (args.Length == 1 && args[0] == "--harness-sql-failure-test")
         {
             await BenchmarkValidationSelfTest.RunOwnedDatabaseFailureAsync();

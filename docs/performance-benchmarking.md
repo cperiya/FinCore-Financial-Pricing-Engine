@@ -857,3 +857,206 @@ Interrupted processes still require the documented manifest-based recovery.
   materialization.
 - Redis, cache consistency, cache failure behavior, and parallel processing
   remain unimplemented and unmeasured.
+
+## Phase 3.3A SQL-only cache feasibility
+
+**Original-run limitation:** the original schedule always measured portfolio A
+scalar-first and portfolio B JSON-first. Mode order is therefore confounded
+with portfolio identity. The results below are retained as historical
+evidence, not a fully counterbalanced comparison. The corrected schedule and
+its separately reported results follow this original section.
+
+The benchmark-only `--cache-feasibility` mode records actual repository price
+IDs and estimates reuse offline; it does not cache prices or change the SQL
+valuation. Run the focused oracle checks with `--cache-feasibility-self-test`
+and a six-sample write/tie pilot with `--cache-feasibility --pilot`. With the
+documented benchmark connection configured, `--cache-feasibility` runs one
+matrix in an ownership-verified database. The fixture applies the existing
+migration only to that newly created database. Reports and compressed
+selection/write traces are retained under the ignored
+`BenchmarkDotNet.Artifacts/CacheFeasibility/` directory. The runner checks a
+20-minute limit between measured pairs and caps compressed trace data at
+64 MiB; these checks do not interrupt a SQL command already in progress.
+Failures leave an incomplete or failure marker. Protected snapshots and owned
+database names are checked around each run.
+
+The original three independent Release runs each used 10 warmups and 100 measured paired
+calls per scenario. Scalar and JSON calls alternated order against the same
+committed state, with a single captured cutoff shared by each pair; scheduled
+price writes occurred between pairs. Current-time cutoffs were captured anew
+for each pair and passed explicitly, rather than exercising the omitted-cutoff
+API path. Every valuation and actual selected price ID was checked against a
+SQL Server `uniqueidentifier`-ordering reference outside the timed interval.
+The benchmark-only price-repository decorator and stage diagnostics add
+measurement overhead. First-client results are in the reports; seeding and
+previous queries may warm SQL caches, so these are **not cold SQL** results.
+No shared SQL buffer or plan caches were cleared.
+
+Each portfolio has two trades per instrument, but the two portfolios have
+different quantities and trade IDs. Prices include older and future rows and
+same-timestamp competing IDs for approximately one instrument in eleven.
+Writes are backdated to a common timestamp; every write invalidates the
+oracle's entries for that instrument. Portfolios alternate between calls.
+
+| Instruments per portfolio | Scenario | Overlap | Writes per 100 calls | Distinct IDs across run | Distinct cutoffs |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 5 | Historical, no writes | 100% | 0 | 5 | 1 |
+| 50 | Current, sparse writes | 50% | 4 | 75 | 100 |
+| 500 | Historical, frequent writes | 0% | 20 | 1,000 | 1 |
+| 2,000 | Current, sparse writes | 100% | 4 | 2,000 | 100 |
+
+These are deliberately selected scenarios, not a factorial comparison:
+workload size, overlap, cutoff and write rate are confounded. The local,
+synthetic, sequential setup does not establish production reuse rates or
+concurrent throughput.
+
+### Measurements
+
+The following are from the second independent run, with 100 observations per
+mode and scenario. Price stage includes the full repository call and EF
+materialization; reader time ends when the reader becomes available. Managed
+allocation is an **approximate process-wide GC delta**, not BenchmarkDotNet
+allocation and not attributable exclusively to one async call.
+
+| Instruments | Mode | Price stage mean ms | Price reader mean ms | Valuation p50 / p95 / p99 ms | Approx. allocated KB/call | Sequential calls/s |
+| ---: | --- | ---: | ---: | --- | ---: | ---: |
+| 5 | Scalar | 3.106 | 2.183 | 14.726 / 21.636 / 23.301 | 243.0 | 65.30 |
+| 5 | JSON | 3.047 | 2.365 | 14.539 / 21.437 / 24.522 | 206.9 | 65.06 |
+| 50 | Scalar | 5.575 | 3.946 | 21.544 / 25.442 / 27.440 | 861.2 | 46.26 |
+| 50 | JSON | 23.887 | 23.146 | 43.074 / 50.158 / 53.090 | 367.4 | 22.89 |
+| 500 | Scalar | 38.364 | 18.428 | 86.263 / 101.689 / 114.208 | 38,363.8 | 11.40 |
+| 500 | JSON | 17.873 | 8.439 | 42.505 / 47.914 / 54.661 | 2,028.9 | 23.36 |
+| 2,000 | Scalar | 285.628 | 109.268 | 595.798 / 682.622 / 708.185 | 574,957.2 | 1.66 |
+| 2,000 | JSON | 53.355 | 15.279 | 104.660 / 123.853 / 131.171 | 7,750.1 | 9.37 |
+
+Across all three runs, mean price-stage times in ms were scalar/JSON:
+5 instruments 3.106–9.224 / 3.047–8.656; 50 instruments
+5.575–10.680 / 23.887–60.024; 500 instruments
+38.364–42.989 / 17.873–19.556; 2,000 instruments
+284.917–298.469 / 53.224–53.589. The first run was noticeably slower
+on the smaller scenarios. In this particular 50-instrument distribution,
+JSON's price stage and valuation were slower in all three runs, with most of
+the price-stage difference visible in reader time. No execution plans were
+captured for this run, so the cause is unknown. This does not justify
+promoting JSON or making an index/query change. Percentiles from 100 samples
+have uncertain tails. The earlier BDN allocations and measurements remain in
+their original sections and are not directly comparable to these async GC
+deltas.
+
+The measured full price-stage mean is an optimistic indication of work a
+perfect full hit might avoid, not an actual or guaranteed end-to-end saving.
+A real cache still needs revision reads, synchronization, serialization,
+network calls and fallback, and may not avoid all materialization.
+
+### Offline reuse estimates
+
+The oracle starts empty after warmup, has unlimited capacity and no expiry,
+assumes perfect invalidation on every price-history write, and stores one
+validity interval per instrument. Exact keys include the exact cutoff;
+intervals are inclusive at the selected timestamp and exclusive at the next
+strictly later timestamp, including future prices. These are hypothetical
+reuse opportunities, not Redis hit rates. Batches follow the existing
+2,000-ID repository boundary. A full batch could hypothetically avoid its
+price SQL reader; a partial batch still requires a reader for misses. Neither
+count includes the additional SQL revision checks a correct cache requires.
+The same counts occurred in each of the three runs:
+
+| Instruments | Requested / per-call distinct ID observations | Repeated selected IDs | Exact hits | Interval hits | Exact batches full / partial / none | Interval batches full / partial / none |
+| ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 5 | 500 / 500 | 495 | 495 | 495 | 99 / 0 / 1 | 99 / 0 / 1 |
+| 50 | 5,000 / 5,000 | 4,921 | 0 | 4,921 | 0 / 0 / 100 | 94 / 5 / 1 |
+| 500 | 50,000 / 50,000 | 48,981 | 48,981 | 48,981 | 79 / 19 / 2 | 79 / 19 / 2 |
+| 2,000 | 200,000 / 200,000 | 197,996 | 0 | 197,996 | 0 / 0 / 100 | 95 / 4 / 1 |
+
+All requested IDs were distinct within each valuation. Repeated selected IDs
+are observations equal to the last observed ID for that instrument, not
+proof that a cache entry is safe. Oracle tests cover initial misses, exact
+and interval hits, invalidation, exclusive interval boundaries, partial
+batches, and rejection of an incorrect selected ID. The pilot also exercises
+database writes and equal-time selection.
+
+### Decision and remaining risks
+
+Defer production Redis. The high theoretical interval reuse is encouraging
+only for these deliberately repetitive workloads; it does not measure Redis
+network or serialization cost, SQL revision reads, revision lock contention,
+writer blocking, invalidation reliability, outage fallback, or all-writer
+enforcement. Backdated and same-time writes can alter historical answers, and
+post-commit invalidation alone is not sufficient for serializable valuation.
+If representative workload evidence later warrants a prototype, use an
+isolated, default-off experiment with SQL-authoritative revision coordination,
+failure/cancellation tests and matched SQL-only comparisons; separately
+approve any schema or migration changes. No Redis package, service,
+production behavior, schema change or default change was introduced here.
+
+### Phase 3.3A counterbalanced rerun
+
+The corrected benchmark uses `counterbalanced-v1`: each four-pair block
+contains A/scalar-first, B/scalar-first, A/JSON-first and B/JSON-first.
+In each 100-pair measured scenario, each portfolio therefore has 25 pairs
+in each order. Ten warmups use 3/2 pairs per order for each portfolio; the
+six-pair pilot uses 2/1. First-client measurements remain scalar-first and
+are reported separately; they are not included in the balanced samples or
+described as cold SQL.
+
+Run `--cache-feasibility-schedule-self-test` for the deterministic block and
+balance checks, and `--cache-feasibility-self-test` for the reuse-oracle
+checks. The oracle is constructed anew for every scenario and run. The
+reports and compressed traces record the run ID, scenario, portfolio IDs,
+phase, sample and block numbers, mode order, per-pair timings and schedule
+counts. Independent trace checks confirmed 25 complete blocks and 25 samples
+per portfolio/order in each scenario of each run. Both modes in a pair use
+the same cutoff and committed state; writes occur between pairs, which can
+also occur within a four-pair block. Financial validation remains outside
+the timed interval.
+
+After the six-pair pilot passed, three independently created, ownership-verified
+databases each ran all four scenarios with 10 warmups and 100 measured pairs
+per mode. The original, order-confounded reports above remain untouched.
+All SQL Server caches were left intact. Scenario factors remain confounded,
+and results remain synthetic, local and sequential.
+
+The following table shows the second corrected run; p50/p95/p99 each use
+100 calls per mode. Stage time includes repository materialization and the
+observer; allocation is an approximate process-wide async GC delta, not
+BenchmarkDotNet allocation.
+
+| Instruments | Mode | Price stage mean ms | Reader mean ms | Valuation p50 / p95 / p99 ms | Approx. allocated KB/call | Sequential calls/s |
+| ---: | --- | ---: | ---: | --- | ---: | ---: |
+| 5 | Scalar | 2.952 | 2.073 | 14.400 / 17.293 / 19.822 | 243.2 | 68.68 |
+| 5 | JSON | 2.888 | 2.177 | 13.986 / 17.177 / 17.971 | 206.4 | 69.83 |
+| 50 | Scalar | 4.862 | 3.295 | 18.411 / 23.242 / 24.094 | 861.9 | 53.47 |
+| 50 | JSON | 18.741 | 18.070 | 35.102 / 43.278 / 51.454 | 368.5 | 27.98 |
+| 500 | Scalar | 47.452 | 23.058 | 111.676 / 150.289 / 163.375 | 38,366.3 | 9.40 |
+| 500 | JSON | 22.121 | 10.335 | 51.662 / 76.949 / 94.417 | 2,029.8 | 19.05 |
+| 2,000 | Scalar | 285.079 | 109.080 | 594.637 / 705.547 / 739.542 | 574,957.6 | 1.66 |
+| 2,000 | JSON | 54.486 | 16.760 | 103.240 / 126.531 / 211.127 | 7,751.1 | 9.30 |
+
+Across the three corrected runs, price-stage means in ms were scalar/JSON:
+5 instruments 2.952-6.412 / 2.888-5.808; 50 instruments
+4.523-5.863 / 17.376-30.264; 500 instruments
+45.145-76.104 / 22.121-37.523; 2,000 instruments
+278.728-285.079 / 49.429-54.486. At 50 instruments JSON remained slower
+in all three runs. For each run, each portfolio/order subgroup contained
+25 pairs; JSON's mean price stage exceeded scalar's in all twelve subgroups.
+No actual plans were captured, so the cause is unknown. The first corrected
+run showed substantial variability, particularly at 500 instruments, and
+100-sample p99s remain uncertain. Neither these observations nor the
+original measurements establish production performance or justify a default
+change.
+
+The hypothetical reuse results matched the original counts in all three
+corrected runs:
+
+| Instruments | Observations | Exact / interval hits | Exact full / partial batches | Interval full / partial batches |
+| ---: | ---: | --- | --- | --- |
+| 5 | 500 | 495 / 495 | 99 / 0 | 99 / 0 |
+| 50 | 5,000 | 0 / 4,921 | 0 / 0 | 94 / 5 |
+| 500 | 50,000 | 48,981 / 48,981 | 79 / 19 | 79 / 19 |
+| 2,000 | 200,000 | 0 / 197,996 | 0 / 0 | 95 / 4 |
+
+There are 100 price batches per scenario; remaining batches are misses.
+These are not measured Redis hits or savings. The unlimited, initially empty
+oracle assumes perfect write invalidation and no expiry, and excludes SQL
+revision reads, locking, Redis latency and failure costs. Continue to defer
+production Redis pending representative workload and consistency evidence.

@@ -15,13 +15,26 @@ internal static class BenchmarkServiceProviderFactory
         string connectionString,
         DbCommandInterceptor? interceptor = null,
         IPortfolioValuationDiagnostics? diagnostics = null,
-        bool useJsonCollectionParameter = false)
+        bool useJsonCollectionParameter = false,
+        CacheFeasibilityObservation? priceObservation = null)
     {
         ServiceCollection services = new();
         services.AddSingleton<PositionCalculationService>();
         services.AddSingleton<StockValuationService>();
         services.AddSingleton<TimeProvider>(TimeProvider.System);
         services.AddFinCoreInfrastructure(connectionString);
+        if (priceObservation is not null)
+        {
+            ServiceDescriptor descriptor = services.Single(
+                item => item.ServiceType == typeof(IMarketPriceRepository));
+            Type implementationType = descriptor.ImplementationType ??
+                throw new InvalidOperationException("The SQL market-price repository registration is not a type.");
+            services.Remove(descriptor);
+            services.AddScoped<IMarketPriceRepository>(provider =>
+                new ObservedMarketPriceRepository(
+                    (IMarketPriceRepository)ActivatorUtilities.CreateInstance(provider, implementationType),
+                    priceObservation));
+        }
         if (useJsonCollectionParameter)
         {
             services.Configure<PortfolioCollectionParameterOptions>(
