@@ -1,5 +1,25 @@
 # Learning journal
 
+## Milestone 3 - PR onboarding and reference corrections
+
+**Decision and documentation:** documented the explicit, existing EF Core
+migration for a fresh local `FinCore` development database, including tooling,
+endpoint, password-handling, verification, and the absence of automatic API
+migration. Existing databases require inspection and authorization before
+an update. Expanded the architecture and class reference to cover the
+benchmark harness, optional diagnostics, scalar default, opt-in JSON, and
+the decision to defer Redis and parallel valuation.
+
+**Verification and remaining work:** the Release build had zero warnings and
+errors; 79 unit/HTTP tests, 23 SQL integration tests, and one database-free
+integration fixture guardrail passed. Benchmark harness failure detection,
+oracle and schedule self-tests passed; the transitive vulnerability audit was
+clean. Protected database row counts were unchanged, and no benchmark- or
+test-run databases remained. EF tooling discovered the checked-in migration
+and generated its SQL offline. No development database migration or complete
+fresh-clone walkthrough was performed. Redis and parallel valuation remain
+unimplemented.
+
 ## Milestone 3 Phase 3.3A - counterbalanced benchmark correction
 
 **Decision and implementation:** corrected the benchmark-only schedule so

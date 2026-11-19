@@ -4,8 +4,8 @@ FinCore is a .NET 10 modular-monolith starter for a financial pricing and
 portfolio risk engine. Its HTTP API values stock positions and supports USD
 portfolio, equity instrument, trade, derived-position, and simulated market
 price workflows. Portfolio persistence uses EF Core 10 and SQL Server 2022;
-trade writes use transaction-owned SQL Server locks. The initial migration is
-applied to the local `FinCore` development database. FinCore does **not** load
+trade writes use transaction-owned SQL Server locks. A fresh local `FinCore`
+development database requires the checked-in migration. FinCore does **not** load
 live market data, convert between currencies, or persist derived positions.
 
 > **Development-only security warning:** This API currently has no
@@ -181,9 +181,28 @@ unchanged.
 
 FinCore provides a local SQL Server 2022 Developer Edition container for
 learning and development only; it is not production configuration. The API
-can connect when `ConnectionStrings__FinCore` is provided. The initial
-migration has been applied to the `FinCore` development database. The Domain
-project remains independent of EF Core and SQL Server.
+can connect when `ConnectionStrings__FinCore` is provided. Apply the existing
+migration explicitly to a fresh development database as described below; the
+API does not migrate at startup. The Domain project remains independent of EF
+Core and SQL Server.
+
+### Prerequisites
+
+- .NET 10 SDK (`dotnet --version`).
+- Docker Desktop with Compose and Linux container support; the supplied
+  Compose file runs SQL Server 2022 Developer Edition.
+- EF Core command-line tooling compatible with the project's EF Core 10.0.0
+  packages. For example, install `dotnet-ef` 10.0.0 if it is not already
+  installed:
+
+  ```powershell
+  dotnet tool install --global dotnet-ef --version 10.0.0
+  dotnet ef --version
+  ```
+
+  If a global version is already installed, update it to 10.0.0 instead with
+  `dotnet tool update --global dotnet-ef --version 10.0.0`. Ensure the .NET
+  global tools directory is on `PATH`.
 
 ### Docker Desktop on Windows
 
@@ -200,7 +219,9 @@ Replace the placeholder password in `.env` with a unique, strong local
 password before starting SQL Server. The SQL Server image requires at least
 eight characters and characters from at least three of these groups:
 uppercase, lowercase, numeric, and special characters. Keep `.env` local; Git
-ignores it.
+ignores it. For the unquoted `.env` and connection-string examples below, use
+letters, digits, and special characters such as `!`, `_`, or `-`; avoid
+whitespace, quotes, semicolons, `$`, and `#`, which need additional escaping.
 
 ```powershell
 docker compose config --quiet
@@ -289,39 +310,82 @@ Do not use it unless you intentionally want to erase local database data.
 - SQL Server may take some time to become ready after the container starts.
   Check its logs rather than relying only on `docker compose ps`.
 
-## Portfolio persistence and migration status
+## Initialize the local development database
 
 The Application repository interfaces and Infrastructure EF Core 10
 implementation are present. The generated migration
 `20261115200739_InitialPortfolioPersistence` in
 [`Persistence/Migrations`](src/FinCore.Infrastructure/Persistence/Migrations/)
-has been applied to the local `FinCore` database. It creates `Portfolios`,
+creates `Portfolios`,
 `Instruments`, `Trades`, and `MarketPrices` with the configured constraints,
-foreign keys, and indexes. The separate `FinCoreIntegrationTests` database
-was not targeted.
+foreign keys, and indexes. A previous local development database was verified
+with this migration; a fresh clone and fresh Docker volume do not contain it.
 
-The applied schema was verified against SQL Server: portfolio and instrument
+The previously applied schema was verified against SQL Server: portfolio and instrument
 names are `nvarchar(200)`, symbols are `nvarchar(20)` with a unique index,
 financial values are `decimal(28,10)`, and timestamps are
 `datetimeoffset(7)`. The trade-history and latest-price indexes match the
 repository query ordering documented in the
 [database design](docs/database-design.md).
 
+After starting the local SQL Server service and waiting for it to be ready,
+run the following from the repository root in PowerShell. This is for a **fresh
+local development database only**. EF may create `FinCore` if it is absent.
+If `FinCore` already contains data or later migrations, inspect its state and
+obtain authorization before running an update: specifying an older target can
+otherwise reverse later migrations. Never use these instructions for
+`FinCoreIntegrationTests` or another database.
+
+The design-time `FinCoreDbContextFactory` reads `ConnectionStrings__FinCore`.
+The fixed server and catalog below select only `127.0.0.1,1433` and `FinCore`;
+verify that this endpoint is your intended local development SQL Server.
+Do not pass a connection string or password as a command-line argument.
+
+```powershell
+$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' } | Select-Object -First 1
+if (-not $passwordLine) { throw 'MSSQL_SA_PASSWORD is missing from .env.' }
+$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
+$env:ConnectionStrings__FinCore = "Server=127.0.0.1,1433;Database=FinCore;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True"
+
+dotnet ef database update 20261115200739_InitialPortfolioPersistence --project .\src\FinCore.Infrastructure\FinCore.Infrastructure.csproj --startup-project .\src\FinCore.Api\FinCore.Api.csproj --context FinCoreDbContext
+if ($LASTEXITCODE -ne 0) { throw 'Development database migration failed.' }
+```
+
+To verify the migration without placing the password in the command line,
+connect to the local database with the password prompt:
+
+```powershell
+docker compose exec sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -d FinCore
+```
+
+At the SQL prompt, run:
+
+```sql
+SELECT DB_NAME() AS DatabaseName;
+SELECT MigrationId FROM dbo.__EFMigrationsHistory ORDER BY MigrationId;
+GO
+```
+
+The database name should be `FinCore` and the history should include
+`20261115200739_InitialPortfolioPersistence`. If the image lacks that
+`sqlcmd` path, use a local SQL client with the connection settings above.
+
 The API registers persistence only when `ConnectionStrings__FinCore` is set.
 Portfolio Application services are registered alongside the repositories and
 unit of work under the same condition; the existing stock endpoints remain
-available without a database connection.
-For local development, this PowerShell session-only setup reads the SA
-password from the ignored `.env` without echoing or placing it in command
-history. Use the same approach when running the API or EF Core commands:
+available without a database connection. The API does **not** apply migrations
+on startup. In the same PowerShell session, start the API after verification:
 
 ```powershell
-$passwordLine = Get-Content .\.env | Where-Object { $_ -match '^MSSQL_SA_PASSWORD=' }
-$saPassword = $passwordLine.Substring('MSSQL_SA_PASSWORD='.Length)
-$env:ConnectionStrings__FinCore = "Server=127.0.0.1,1433;Database=FinCore;User Id=sa;Password=$saPassword;Encrypt=True;TrustServerCertificate=True"
-# Run the local API or EF Core command in this PowerShell session.
+dotnet run --project .\src\FinCore.Api\FinCore.Api.csproj
+```
+
+After stopping the API, clear the session-only connection and password:
+
+```powershell
 Remove-Item Env:\ConnectionStrings__FinCore -ErrorAction SilentlyContinue
 $saPassword = $null
+$passwordLine = $null
 ```
 
 The connection uses SQL authentication, encryption, and trusts the
